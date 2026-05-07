@@ -1,0 +1,17 @@
+defaults:
+  - host: default
+  - run_type: ai4smallfarms
+  - experiment: p2p_ai4smallfarms
+  - training: default
+  - evaluation: val
+  - _self_
+
+output_dir: ${.experiment.dataset.out_path}/${.experiment.model.name}/${.experiment.encoder.in_size}/${.experiment.name}/${now:%Y-%m-%d_%H-%M-%S}
+
+checkpoint: null
+
+num_workers: ${.run_type.num_workers}
+
+hydra:
+  run:
+    dir: ${...output_dir}

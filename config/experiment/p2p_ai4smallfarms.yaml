@@ -1,0 +1,11 @@
+defaults:
+  - /dataset: ai4smallfarms
+  - /encoder: vit_s2
+  - /model: pix2poly_fields
+  - _self_
+
+name: v1_image_vit_bs4_ai4smallfarms
+group_name: v1_${.model.name}
+project_name: AI4SmallFarms
+
+lidar_dropout: null

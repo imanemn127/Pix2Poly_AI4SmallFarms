@@ -1,0 +1,10 @@
+name: default
+# SET: absolute path to the sentinel-2-asia data directory
+data_root: /path/to/sentinel-2-asia
+# SET: absolute path to the parent output directory
+model_root: /path/to/AI4SmallFarms_output
+
+multi_gpu: false
+device: cuda
+
+update_pbar_every: 1

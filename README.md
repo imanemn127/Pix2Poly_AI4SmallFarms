@@ -43,10 +43,12 @@ Pix2Poly_AI4SmallFarms/
 │   ├── config.yaml
 │   ├── dataset/ai4smallfarms.yaml
 │   ├── encoder/vit_s2.yaml
+│   ├── evaluation/val.yaml
 │   ├── experiment/p2p_ai4smallfarms.yaml
 │   ├── host/default.yaml
 │   ├── model/pix2poly_fields.yaml
-│   └── run_type/ai4smallfarms.yaml
+│   ├── run_type/ai4smallfarms.yaml
+│   └── training/default.yaml
 └── scripts/
     ├── build_coco_dataset.py   # tile → COCO patches
     ├── inspect_coco.py         # sanity-check visualisation

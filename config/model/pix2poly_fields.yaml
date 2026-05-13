@@ -7,25 +7,25 @@ decoder:
   in_feature_dim: 256
 
 tokenizer:
-  num_bins: 64              # one bin per pixel column/row (matches patch size)
+  num_bins: 64
   shuffle_tokens: false
-  max_num_vertices: 1024    # maximum total vertices across all polygons in one patch
-  max_len: 2050             # 1024 * 2 + BOS + EOS
-  pad_idx: null             # computed at runtime: num_bins + 3 special tokens
-  generation_steps: 2050
+  max_num_vertices: 768  
+  max_len: null          # computed at runtime: 768*2+2 = 1538  
+  pad_idx: null          # computed at runtime: 67 (64+BOS+EOS+PAD)
+  generation_steps: 1538
 
 shuffle_polygons: false
 
 fusion: patch_concat
 
-# Optimisation
+# optimization
 sinkhorn_iterations: 100
 vertex_loss_weight: 1.0
 perm_loss_weight: 10.0
 
-# Training
+# training
 batch_size:   ${...run_type.batch_size}
 start_epoch: 0
-num_epochs: 200
+num_epochs: 100
 learning_rate: 3e-4
 weight_decay:  1e-4

@@ -1,7 +1,7 @@
 name: release
-batch_size: 2
+batch_size: 4
 train_subset: null
-val_subset:   null
+val_subset:   100
 test_subset:  null
 logging: INFO
 num_workers: 8

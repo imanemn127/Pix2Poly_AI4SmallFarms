@@ -2,74 +2,92 @@ import sys
 import os
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Make local modules (p3_coco.py, modified_vit.py) importable before anything
-# in pixelspointspolygons tries to import them.
-# ---------------------------------------------------------------------------
+# === AI4SmallFarms local patches ===
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ---------------------------------------------------------------------------
-# Patch 1: Dataset classes
-# Replace the installed P3Dataset and its Train/Val/Test subclasses with the
-# local versions from p3_coco.py.  The local classes add _safe_to_tensor()
-# (NumPy 2.x compatibility) and remove LiDAR loading.
-# ---------------------------------------------------------------------------
+# 1. p3_coco safety patch
 import p3_coco as local_p3_coco
 import pixelspointspolygons.datasets.p3_coco as pkg_p3_coco
-
-pkg_p3_coco.P3Dataset    = local_p3_coco.P3Dataset
+pkg_p3_coco.P3Dataset   = local_p3_coco.P3Dataset
 pkg_p3_coco.TrainDataset = local_p3_coco.TrainDataset
-pkg_p3_coco.ValDataset   = local_p3_coco.ValDataset
-pkg_p3_coco.TestDataset  = local_p3_coco.TestDataset
+pkg_p3_coco.ValDataset  = local_p3_coco.ValDataset
+pkg_p3_coco.TestDataset = local_p3_coco.TestDataset
 
-# ---------------------------------------------------------------------------
-# Patch 2: ViT backbone
-# Replace ViT in both the vision_transformer module and the model_pix2poly
-# module with the local ModifiedViT from modified_vit.py, which builds the
-# model at img_size=64 and discards pretrained positional embeddings so they
-# are learned from scratch.
-# ---------------------------------------------------------------------------
+# 2. ViT interpolation patch (64x64)
 import modified_vit
 import pixelspointspolygons.models.vision_transformer as vit_module
+vit_module.ViT = modified_vit.ViT
 import pixelspointspolygons.models.pix2poly.model_pix2poly as model_pix2poly_module
-
-vit_module.ViT           = modified_vit.ViT
 model_pix2poly_module.ViT = modified_vit.ViT
 
-# ---------------------------------------------------------------------------
-# Patch 3: Visualisation denormalisation
-# The trainer calls denormalize_image_for_visualization from its own module
-# namespace, so we must replace it in both shared_utils and trainer_pix2poly.
-# The default function assumes uint8 RGB images; we need a Sentinel-2-aware
-# version that inverts the [0, 1] Normalize transform and rescales to uint8.
-# ---------------------------------------------------------------------------
+# 3. Patch evaluator category for AI4SmallFarms (field = 1, not building 100)
+from copy import deepcopy
+from pycocotools.cocoeval import COCOeval
+import pixelspointspolygons.eval.evaluator as eval_module
+
+original_compute_coco = eval_module.Evaluator.compute_coco_metrics
+def patched_compute_coco(self, annType='segm'):
+    cocoEval = COCOeval(deepcopy(self.cocoGt), deepcopy(self.cocoDt), iouType=annType)
+    cocoEval.params.catIds = [1]          # field category
+    cocoEval.evaluate()
+    cocoEval.accumulate()
+    cocoEval.summarize()
+    return {
+        'AP': cocoEval.stats[0], 'AP50': cocoEval.stats[1],
+        'AP75': cocoEval.stats[2], 'AP_small': cocoEval.stats[3],
+        'AP_medium': cocoEval.stats[4], 'AP_large': cocoEval.stats[5],
+        'AR1': cocoEval.stats[6], 'AR10': cocoEval.stats[7],
+        'AR100': cocoEval.stats[8], 'AR_small': cocoEval.stats[9],
+        'AR_medium': cocoEval.stats[10], 'AR_large': cocoEval.stats[11]
+    }
+eval_module.Evaluator.compute_coco_metrics = patched_compute_coco
+
+# Fix category_id in predictions (field=1, not building=100)
+import pixelspointspolygons.misc.coco_conversions as coco_conv_module
+original_generate_coco_ann = coco_conv_module.generate_coco_ann
+
+def patched_generate_coco_ann(polygon_list, img_id, scores=None):
+    anns = original_generate_coco_ann(polygon_list, img_id, scores)
+    for ann in anns:
+        ann['category_id'] = 1
+    return anns
+
+coco_conv_module.generate_coco_ann = patched_generate_coco_ann
+# Also patch the reference imported in predictor_pix2poly
+import pixelspointspolygons.predict.predictor_pix2poly as pred_module
+pred_module.generate_coco_ann = patched_generate_coco_ann
+
+# 4. Fix visualization for Sentinel-2 uint16 images
+import pixelspointspolygons.misc.shared_utils as shared_utils
+
+original_denorm = shared_utils.denormalize_image_for_visualization
+
 def denormalize_s2(image, cfg):
-    """Denormalise a Sentinel-2 image tensor to a displayable uint8 numpy array."""
-    image     = image.detach().cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
-    mean      = cfg.experiment.encoder.image_mean
-    std       = cfg.experiment.encoder.image_std
+    """Denormalize a Sentinel-2 image tensor to a displayable uint8 numpy array."""
+    image = image.detach().cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
+    mean = cfg.experiment.encoder.image_mean
+    std  = cfg.experiment.encoder.image_std
     max_pixel = cfg.experiment.encoder.image_max_pixel_value
 
     # Inverse of Normalize: pixel = (value * std + mean) * max_pixel
     image = image * std + mean
     image = image * max_pixel
+
+    # Clip to valid range and rescale to [0, 255]
     image = np.clip(image, 0, max_pixel)
     image = (image / max_pixel * 255).astype(np.uint8)
+
     return image
 
-import pixelspointspolygons.misc.shared_utils as shared_utils
-import pixelspointspolygons.train.trainer_pix2poly as trainer_module
-
-shared_utils.denormalize_image_for_visualization  = denormalize_s2
-trainer_module.denormalize_image_for_visualization = denormalize_s2
-
-# ---------------------------------------------------------------------------
-# Standard training entry point
-# ---------------------------------------------------------------------------
+shared_utils.denormalize_image_for_visualization = denormalize_s2
+# ============================================
 import hydra
 from pixelspointspolygons.train import Pix2PolyTrainer
-from pixelspointspolygons.misc.shared_utils import setup_ddp, setup_hydraconf
+from pixelspointspolygons.misc.shared_utils import setup_ddp, setup_hydraconf   # ← ajouter cette ligne
 
+# Patch trainer for visualisation
+import pixelspointspolygons.train.trainer_pix2poly as trainer_module
+trainer_module.denormalize_image_for_visualization = denormalize_s2
 
 @hydra.main(config_path="./config", config_name="config", version_base="1.3")
 def main(cfg):
@@ -82,7 +100,6 @@ def main(cfg):
         raise ValueError(f"Unknown model name: {cfg.experiment.model.name}")
 
     trainer.train()
-
 
 if __name__ == "__main__":
     main()

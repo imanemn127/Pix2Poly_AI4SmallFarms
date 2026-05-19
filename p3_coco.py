@@ -64,10 +64,32 @@ class P3Dataset(Dataset):
         with suppress_stdout():
             self.coco = COCO(self.ann_file)
         images_id = self.coco.getImgIds()
-        self.tile_ids = images_id.copy()
+        # self.tile_ids = images_id.copy()
+        # self.num_samples = len(self.tile_ids)
+
+        # Filter out patches whose total vertex count exceeds max_num_vertices.
+        # Those patches would be silently truncated by the tokenizer, producing
+        # incomplete polygon sequences. ~1% of patches at max_num_vertices=384.
+        max_v = cfg.experiment.model.tokenizer.max_num_vertices
+        filtered_ids = []
+        for img_id in images_id:
+            total_verts = sum(
+                len(seg) // 2 - 1          # closed polygon: first point == last
+                for ann in self.coco.imgToAnns.get(img_id, [])
+                for seg in ann["segmentation"]
+            )
+            if total_verts <= max_v:
+                filtered_ids.append(img_id)
+        n_removed = len(images_id) - len(filtered_ids)
+        self.tile_ids = filtered_ids
         self.num_samples = len(self.tile_ids)
 
-        self.logger.info(f"Loaded {len(self.coco.anns.items())} annotations from {len(self.coco.imgs.items())} images from {self.ann_file}")
+        # self.logger.info(f"Loaded {len(self.coco.anns.items())} annotations from {len(self.coco.imgs.items())} images from {self.ann_file}")
+        self.logger.info(
+            f"Loaded {len(self.coco.anns.items())} annotations from "
+            f"{len(self.coco.imgs.items())} images from {self.ann_file} "
+            f"(removed {n_removed} patches exceeding {max_v} vertices)"
+        )
 
         self.use_lidar = cfg.experiment.encoder.use_lidar
         self.use_images = cfg.experiment.encoder.use_images
@@ -441,6 +463,15 @@ class P3Dataset(Dataset):
             image = augmentations['image']
             corner_coords = np.array(augmentations['keypoints'])
 
+            # Filter out-of-bounds keypoints
+            corner_coords = np.array(augmentations['keypoints'])
+            if len(corner_coords) > 0:
+                h = img_info['height']
+                w = img_info['width']
+                # clip vertices that fell slightly outside due to rotation
+                corner_coords[:, 0] = np.clip(corner_coords[:, 0], 0, h - 1)  # row (y)
+                corner_coords[:, 1] = np.clip(corner_coords[:, 1], 0, w - 1)  # col (x)
+
         coords_seqs, rand_idxs = self.tokenizer(corner_coords, shuffle=self.cfg.experiment.model.tokenizer.shuffle_tokens)
 
         coords_seqs = torch.LongTensor(coords_seqs)
@@ -539,13 +570,13 @@ class P3Dataset(Dataset):
         if len(corner_coords) > self.cfg.experiment.model.tokenizer.max_num_vertices:
             corner_coords = corner_coords[:self.cfg.experiment.model.tokenizer.max_num_vertices]
 
-        if self.transform is not None: 
-            
+        if self.transform is not None:
+
             augmentations = self.transform(image=image, keypoints=corner_coords.tolist())
-            
+
             if self.use_lidar:
                 lidar = self.apply_d4_augmentations_to_lidar(augmentations["replay"], lidar)
-            
+
             image = augmentations['image']
             corner_coords = np.array(augmentations['keypoints'])
 
@@ -554,7 +585,7 @@ class P3Dataset(Dataset):
         if self.cfg.experiment.model.tokenizer.shuffle_tokens:
             perm_matrix = self.shuffle_perm_matrix_by_indices(perm_matrix, rand_idxs)
 
-        
+
         return image, lidar, coords_seqs, perm_matrix, torch.tensor([img_info['id']])
 
 

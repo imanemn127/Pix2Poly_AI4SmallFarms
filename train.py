@@ -13,14 +13,19 @@ pkg_p3_coco.TrainDataset = local_p3_coco.TrainDataset
 pkg_p3_coco.ValDataset  = local_p3_coco.ValDataset
 pkg_p3_coco.TestDataset = local_p3_coco.TestDataset
 
-# 2. ViT interpolation patch (64x64)
+# 2. Fix missing cv2 import in build_datasets
+import cv2
+import pixelspointspolygons.datasets.build_datasets as build_datasets_module
+build_datasets_module.cv2 = cv2
+
+# 3. ViT interpolation patch (64x64)
 import modified_vit
 import pixelspointspolygons.models.vision_transformer as vit_module
 vit_module.ViT = modified_vit.ViT
 import pixelspointspolygons.models.pix2poly.model_pix2poly as model_pix2poly_module
 model_pix2poly_module.ViT = modified_vit.ViT
 
-# 3. Patch evaluator category for AI4SmallFarms (field = 1, not building 100)
+# 4. Patch evaluator category for AI4SmallFarms (field = 1, not building 100)
 from copy import deepcopy
 from pycocotools.cocoeval import COCOeval
 import pixelspointspolygons.eval.evaluator as eval_module
@@ -57,37 +62,131 @@ coco_conv_module.generate_coco_ann = patched_generate_coco_ann
 import pixelspointspolygons.predict.predictor_pix2poly as pred_module
 pred_module.generate_coco_ann = patched_generate_coco_ann
 
-# 4. Fix visualization for Sentinel-2 uint16 images
+# 5. Fix visualization for Sentinel-2 uint16 images
 import pixelspointspolygons.misc.shared_utils as shared_utils
 
 original_denorm = shared_utils.denormalize_image_for_visualization
 
 def denormalize_s2(image, cfg):
-    """Denormalize a Sentinel-2 image tensor to a displayable uint8 numpy array."""
+    """Denormalize a Sentinel-2 image tensor to a displayable uint8 numpy array.
+    Uses per-channel p2-p98 percentile stretch because S2 reflectance clusters
+    in a narrow low range — linear /max_pixel produces near-black images.
+    """
     image = image.detach().cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
-    mean = cfg.experiment.encoder.image_mean
-    std  = cfg.experiment.encoder.image_std
+    mean = np.array(cfg.experiment.encoder.image_mean)
+    std  = np.array(cfg.experiment.encoder.image_std)
     max_pixel = cfg.experiment.encoder.image_max_pixel_value
 
     # Inverse of Normalize: pixel = (value * std + mean) * max_pixel
     image = image * std + mean
     image = image * max_pixel
-
-    # Clip to valid range and rescale to [0, 255]
     image = np.clip(image, 0, max_pixel)
-    image = (image / max_pixel * 255).astype(np.uint8)
 
-    return image
+    # Per-channel percentile stretch so dark S2 imagery becomes visible
+    out = np.zeros_like(image, dtype=np.uint8)
+    for c in range(image.shape[2]):
+        lo, hi = np.percentile(image[:, :, c], [2, 98])
+        if hi > lo:
+            out[:, :, c] = np.clip(
+                (image[:, :, c] - lo) / (hi - lo) * 255, 0, 255
+            ).astype(np.uint8)
+    return out
 
 shared_utils.denormalize_image_for_visualization = denormalize_s2
 # ============================================
+import types
+import torch.nn as nn
 import hydra
 from pixelspointspolygons.train import Pix2PolyTrainer
-from pixelspointspolygons.misc.shared_utils import setup_ddp, setup_hydraconf   # ← ajouter cette ligne
+from pixelspointspolygons.misc.shared_utils import setup_ddp, setup_hydraconf
 
 # Patch trainer for visualisation
 import pixelspointspolygons.train.trainer_pix2poly as trainer_module
 trainer_module.denormalize_image_for_visualization = denormalize_s2
+
+
+def patch_decoder(model):
+    """Only bump dropout — no forward/predict wrapping to avoid train/inference mismatch."""
+    dec = model.decoder
+
+    for layer in dec.decoder.layers:
+        layer.dropout.p = 0.2
+        layer.self_attn.dropout = 0.2
+        layer.multihead_attn.dropout = 0.2
+
+def _rebuild_scheduler(trainer):
+    # the warmup/total steps are stored in the lambda's keyword closure
+    sched_keywords = trainer.lr_scheduler.lr_lambdas[0].keywords
+    import warnings
+    from transformers import get_linear_schedule_with_warmup
+    # LambdaLR calls step() once during __init__, which triggers a spurious
+    # "scheduler before optimizer" warning because the new optimizer has no
+    # prior steps yet. Suppress it locally — the order is correct at runtime.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`")
+        trainer.lr_scheduler = get_linear_schedule_with_warmup(
+            trainer.optimizer,
+            num_warmup_steps=sched_keywords["num_warmup_steps"],
+            num_training_steps=sched_keywords["num_training_steps"],
+        )
+
+
+def patch_optimizer_strategy_a(trainer):
+    """Freeze ViT attention blocks. Separate LRs for patch embed and decoder."""
+    import torch.optim as optim
+    model = trainer.model
+    cfg = trainer.cfg.experiment.model
+
+    # freeze attention blocks — DINO features are strong, protect them
+    for param in model.encoder.vit.blocks.parameters():
+        param.requires_grad = False
+
+    patch_embed_params = list(model.encoder.vit.patch_embed.parameters())
+    pos_embed_params   = [model.encoder.vit.pos_embed]  # nn.Parameter, not a module
+    decoder_params     = list(model.decoder.parameters())
+    other_params       = [
+        p for p in model.parameters()
+        if p.requires_grad
+        and not any(p is q for q in patch_embed_params + pos_embed_params + decoder_params)
+    ]
+
+    trainer.optimizer = optim.AdamW([
+        {"params": patch_embed_params, "lr": 5e-4},
+        {"params": pos_embed_params,   "lr": 5e-4},
+        {"params": decoder_params,     "lr": 1e-3},
+        {"params": other_params,       "lr": cfg.learning_rate},
+    ], weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+
+    _rebuild_scheduler(trainer)
+
+
+def patch_optimizer_strategy_b(trainer):
+    """Train all 3 parts with separate LRs — no freezing."""
+    import torch.optim as optim
+    model = trainer.model
+    cfg = trainer.cfg.experiment.model
+
+    patch_embed_params  = list(model.encoder.vit.patch_embed.parameters())
+    pos_embed_params    = [model.encoder.vit.pos_embed]
+    attention_params    = list(model.encoder.vit.blocks.parameters())
+    decoder_params      = list(model.decoder.parameters())
+    other_params        = [
+        p for p in model.parameters()
+        if p.requires_grad
+        and not any(p is q for q in patch_embed_params + pos_embed_params
+                                   + attention_params + decoder_params)
+    ]
+
+    trainer.optimizer = optim.AdamW([
+        {"params": patch_embed_params, "lr": 5e-4},
+        {"params": pos_embed_params,   "lr": 5e-4},
+        {"params": attention_params,   "lr": 1e-5},
+        {"params": decoder_params,     "lr": 1e-3},
+        {"params": other_params,       "lr": cfg.learning_rate},
+    ], weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+
+    _rebuild_scheduler(trainer)
+
 
 @hydra.main(config_path="./config", config_name="config", version_base="1.3")
 def main(cfg):
@@ -99,6 +198,25 @@ def main(cfg):
     else:
         raise ValueError(f"Unknown model name: {cfg.experiment.model.name}")
 
+    # trainer.model is None here — it is only built inside trainer.train().
+    # We override train() to intercept the moment after setup_model() and
+    # setup_optimizer() have run, so our patches see a fully built model.
+    def patched_train(self):
+        from pixelspointspolygons.misc import seed_everything
+        seed_everything(42)
+        self.setup_model()       # model is built here
+        self.setup_dataloader()
+        self.setup_optimizer()   # optimizer + scheduler built here
+        self.setup_loss_fn_dict()
+
+        # now model and optimizer exist — safe to patch
+        patch_decoder(self.model)
+        patch_optimizer_strategy_b(self)   # swap to _a when ready
+
+        self.train_val_loop()
+        self.cleanup()
+
+    trainer.train = types.MethodType(patched_train, trainer)
     trainer.train()
 
 if __name__ == "__main__":

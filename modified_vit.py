@@ -1,7 +1,6 @@
 """
 Local copy of ViT modified for AI4SmallFarms.
-Uses 64×64 input with positional embeddings learned from scratch.
-The interpolation code is commented for documentation.
+Uses 32×32 input with both patch embedding and positional embeddings learned from scratch.
 """
 
 import logging
@@ -30,10 +29,10 @@ class ViT(nn.Module):
 
         logging.getLogger('timm').setLevel(logging.WARNING)
 
-        # Build model with the new image size (64×64)
+        # Build model with the new image size (32×32)
         self.vit = timm.create_model(
             model_name=cfg.experiment.encoder.type,     # e.g., "vit_small_patch8_224.dino"
-            img_size=cfg.experiment.encoder.in_size,    # 64
+            img_size=cfg.experiment.encoder.in_size,    # 32
             patch_size=cfg.experiment.encoder.patch_size,
             num_classes=0,
             global_pool='',
@@ -44,42 +43,12 @@ class ViT(nn.Module):
             state_dict = torch.load(cfg.experiment.encoder.checkpoint_file,
                                     map_location=self.cfg.host.device)
 
-            # ------------------------------------------------------------------
-            # OPTION: Interpolation – kept for reference.
-            # We now learn positional embeddings from scratch instead.
-            # ------------------------------------------------------------------
-            # if 'pos_embed' in state_dict:
-            #     pos_embed_ckpt = state_dict['pos_embed']           # (1, num_patches+1, dim)
-            #     num_patches_ckpt = pos_embed_ckpt.shape[1] - 1
-            #     grid_size_ckpt = int(num_patches_ckpt ** 0.5)       # 28 for 224×224
-            #
-            #     new_grid_size = (cfg.experiment.encoder.in_size //
-            #                      cfg.experiment.encoder.patch_size)  # 8 for 64×64
-            #
-            #     if grid_size_ckpt != new_grid_size:
-            #         self.logger.info(
-            #             f"Interpolating positional embeddings "
-            #             f"from {grid_size_ckpt}×{grid_size_ckpt} to {new_grid_size}×{new_grid_size}"
-            #         )
-            #
-            #         class_token = pos_embed_ckpt[:, 0:1, :]
-            #         patch_embed = pos_embed_ckpt[:, 1:, :]
-            #         patch_embed = patch_embed.reshape(1, grid_size_ckpt, grid_size_ckpt, -1)
-            #         patch_embed = patch_embed.permute(0, 3, 1, 2)
-            #
-            #         patch_embed = F.interpolate(
-            #             patch_embed,
-            #             size=(new_grid_size, new_grid_size),
-            #             mode='bicubic',
-            #             align_corners=False,
-            #         )
-            #         patch_embed = patch_embed.permute(0, 2, 3, 1)
-            #         patch_embed = patch_embed.reshape(1, new_grid_size * new_grid_size, -1)
-            #         state_dict['pos_embed'] = torch.cat([class_token, patch_embed], dim=1)
+            # --- Remove pretrained patch_embed (incompatible size) ---
+            for key in list(state_dict.keys()):
+                if 'patch_embed' in key:
+                    del state_dict[key]
 
-            # --- Learn positional embeddings from scratch ---
-            # Remove the pretrained pos_embed so the model keeps its freshly
-            # initialised random positional embeddings (for the new grid).
+            # --- Discard pretrained pos_embed (we learn it from scratch) ---
             if 'pos_embed' in state_dict:
                 self.logger.info(
                     "Discarding pretrained positional embeddings – "

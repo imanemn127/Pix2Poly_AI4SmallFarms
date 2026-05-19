@@ -7,12 +7,12 @@ decoder:
   in_feature_dim: 256
 
 tokenizer:
-  num_bins: 64
+  num_bins: 32
   shuffle_tokens: false
-  max_num_vertices: 768  
-  max_len: null          # computed at runtime: 768*2+2 = 1538  
-  pad_idx: null          # computed at runtime: 67 (64+BOS+EOS+PAD)
-  generation_steps: 1538
+  max_num_vertices: 384  
+  max_len: null          # computed at runtime: 384*2+2 = 770  
+  pad_idx: null          # computed at runtime: 35 (32+BOS+EOS+PAD)
+  generation_steps: 770
 
 shuffle_polygons: false
 

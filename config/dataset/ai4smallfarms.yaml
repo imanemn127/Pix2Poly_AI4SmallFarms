@@ -1,16 +1,14 @@
 name: PixelsPointsPolygons
 size: ${..encoder.in_size}
-# SET: absolute path to the sentinel-2-asia data directory
-in_path: /path/to/sentinel-2-asia
-# SET: absolute path to the output directory for checkpoints and logs
-out_path: /path/to/AI4SmallFarms_output
+in_path: /mnt/DATA/IMANE/AI4SmallFarms/sentinel-2-asia
+out_path: /mnt/DATA/IMANE/AI4SmallFarms_output
 annotation_type: fields
 country: Asia
 
 annotations:
-  train: ${..dataset.in_path}/output_coco_64/train_coco.json
-  val:   ${..dataset.in_path}/output_coco_64/val_coco.json
-  test:  ${..dataset.in_path}/output_coco_64/test_coco.json
+  train: /mnt/DATA/IMANE/AI4SmallFarms/sentinel-2-asia/output_coco_32/train_coco.json
+  val:   /mnt/DATA/IMANE/AI4SmallFarms/sentinel-2-asia/output_coco_32/val_coco.json
+  test:  /mnt/DATA/IMANE/AI4SmallFarms/sentinel-2-asia/output_coco_32/test_coco.json
 
 train_subset: ${...run_type.train_subset}
 val_subset:   ${...run_type.val_subset}

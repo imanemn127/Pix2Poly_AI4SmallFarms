@@ -1,10 +1,12 @@
 name: default
-# SET: absolute path to the sentinel-2-asia data directory
-data_root: /path/to/sentinel-2-asia
-# SET: absolute path to the parent output directory
-model_root: /path/to/AI4SmallFarms_output
+data_root: /mnt/DATA/IMANE/AI4SmallFarms/sentinel-2-asia
+model_root: /mnt/DATA/IMANE
 
 multi_gpu: false
 device: cuda
 
 update_pbar_every: 1
+
+ldof_exe: /path/to/calculate/DoF/exe
+dino_v2_repo: /path/to/dinov2/repo
+dino_v3_repo: /path/to/dinov3/repo

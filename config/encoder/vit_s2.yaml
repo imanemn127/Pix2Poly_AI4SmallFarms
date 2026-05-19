@@ -3,29 +3,26 @@ name: vit
 use_images: true
 use_lidar: false
 
-type: vit_small_patch8_224.dino
-# SET: absolute path to the DINO ViT-S/8 pretrained backbone checkpoint
-checkpoint_file: /path/to/backbones/dino_deitsmall8_pretrain.pth
-pretrained: true
+type: vit_small_patch8_224.dino   
+checkpoint_file: /mnt/DATA/IMANE/PixelsPointsPolygons_output/backbones/dino_deitsmall8_pretrain.pth
+pretrained: True
 
-# Image input dimensions (64x64 patches)
-in_size: 64
+# image input dimensions
+in_size: 32
 in_height: ${.in_size}
 in_width:  ${.in_size}
 
-# Patching — 64 / 8 = 8 patches per side, 64 patches total
-patch_size: 8
-patch_feature_size: 8
+# patching
+patch_size: 2
+patch_feature_size: 16          # 32 / 2
 patch_feature_height: ${.patch_feature_size}
 patch_feature_width:  ${.patch_feature_size}
 patch_feature_dim: 384
-num_patches: 64
+num_patches: 256                 # (32 / 2)^2
 
 out_feature_dim: ${..model.decoder.in_feature_dim}
 
-# Sentinel-2 uint16: reflectance values scaled x10000.
-# Normalize divides by max_pixel_value after subtracting mean*max and dividing by std*max.
-# Currently set to identity (mean=0, std=1) — update with per-dataset statistics if needed.
+# Sentinel-2 uint16: reflectance scaled ×10000
 image_mean: [0.0, 0.0, 0.0]
 image_std:  [1.0, 1.0, 1.0]
 image_max_pixel_value: 10000.0

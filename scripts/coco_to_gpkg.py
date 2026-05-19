@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 coco_to_gpkg.py
 
@@ -11,9 +10,9 @@ using the per-image top_left, res_x, and res_y metadata stored by
 build_coco_dataset.py.
 
 Usage:
-  python scripts/coco_to_gpkg.py \
-      --json /path/to/output_coco_64/val_coco.json \
-      --out  /path/to/val_annotations_geo.gpkg \
+  python coco_to_gpkg.py \
+      --json /path/to/output_coco_64/train_coco.json \
+      --out  /path/to/train_annotations_geo.gpkg \
       --epsg 32648
 """
 
@@ -28,14 +27,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert COCO JSON annotations to a geographic GeoPackage"
     )
-    parser.add_argument("--json", required=True,
-                        help="Path to the COCO JSON file (e.g. output_coco_64/val_coco.json)")
-    parser.add_argument("--out",  required=True,
-                        help="Output GeoPackage path (e.g. val_annotations_geo.gpkg)")
-    parser.add_argument("--epsg", type=int, default=32648,
-                        help="EPSG code of the tile CRS "
-                             "(default: 32648 = WGS84 / UTM zone 48N). "
-                             "Adapt to match the CRS of your Sentinel-2 tiles.")
+    parser.add_argument(
+        "--json", required=True,
+        help="Path to the COCO JSON file (e.g. output_coco_56/val_coco.json)"
+    )
+    parser.add_argument(
+        "--out", required=True,
+        help="Output GeoPackage path (e.g. val_annotations_geo.gpkg)"
+    )
+    parser.add_argument(
+        "--epsg", type=int, default=32648,
+        help="EPSG code of the tile CRS (default: 32648 = WGS84 / UTM zone 48N). "
+             "Adapt to match the CRS of your Sentinel-2 tiles."
+    )
     args = parser.parse_args()
 
     with open(args.json, encoding="utf-8") as f:
@@ -45,10 +49,10 @@ def main():
 
     rows = []
     for ann in coco["annotations"]:
-        img      = images_by_id[ann["image_id"]]
+        img = images_by_id[ann["image_id"]]
         top_left = img["top_left"]   # [x, y] of the patch's top-left corner in UTM
-        res_x    = img["res_x"]
-        res_y    = img["res_y"]
+        res_x = img["res_x"]
+        res_y = img["res_y"]
 
         for seg in ann["segmentation"]:
             # Convert flat pixel list [x0,y0, x1,y1, ...] to UTM map coordinates.

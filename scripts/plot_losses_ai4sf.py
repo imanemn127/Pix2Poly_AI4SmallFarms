@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 
 def find_latest_run():
     """Return the path of the most recent run containing a metrics.csv file."""
-    base = "/mnt/DATA/IMANE/AI4SmallFarms_output/pix2poly/64/v1_image_vit_bs4_ai4smallfarms"
+    base = "/mnt/DATA/IMANE/AI4SmallFarms_output/pix2poly/32/v1_image_vit_bs4_ai4smallfarms"
     pattern = os.path.join(base, "*/metrics.csv")
     runs = sorted(glob.glob(pattern))
     if not runs:
@@ -44,7 +44,7 @@ def main():
         if run_dir is None:
             sys.exit(
                 "No runs found under "
-                "/mnt/DATA/IMANE/AI4SmallFarms_output/pix2poly/64/"
+                "/mnt/DATA/IMANE/AI4SmallFarms_output/pix2poly/32/"
                 "v1_image_vit_bs4_ai4smallfarms"
             )
         print(f"Auto‑detected latest run: {run_dir}")

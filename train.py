@@ -161,29 +161,51 @@ def patch_optimizer_strategy_a(trainer):
 
 
 def patch_optimizer_strategy_b(trainer):
-    """Train all 3 parts with separate LRs — no freezing."""
+    """Train all parts with separate LRs — no freezing.
+
+    Parameter group  |  LR
+    patch_embed      |  5e-4  (re-learn spatial tokens for new 32x32 resolution)
+    pos_embed        |  5e-4  (discarded from pretraining, needs to be learned)
+    attn_blocks      |  1e-5  (preserve DINO representations, adapt slowly)
+    decoder          |  1e-3  (freshly initialised, train aggressively)
+    other            |  3e-4  (MLP, norm, bottleneck, scorenets)
+    """
     import torch.optim as optim
     model = trainer.model
     cfg = trainer.cfg.experiment.model
 
-    patch_embed_params  = list(model.encoder.vit.patch_embed.parameters())
-    pos_embed_params    = [model.encoder.vit.pos_embed]
-    attention_params    = list(model.encoder.vit.blocks.parameters())
-    decoder_params      = list(model.decoder.parameters())
-    other_params        = [
-        p for p in model.parameters()
-        if p.requires_grad
-        and not any(p is q for q in patch_embed_params + pos_embed_params
-                                   + attention_params + decoder_params)
+    patch_embed_params, pos_embed_params, attn_params, decoder_params, other_params = [], [], [], [], []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "encoder.vit.patch_embed" in name:
+            patch_embed_params.append(param)
+        elif name == "encoder.vit.pos_embed":
+            pos_embed_params.append(param)
+        elif "encoder.vit.blocks" in name and ".attn." in name:
+            attn_params.append(param)
+        elif "decoder." in name:
+            decoder_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = [
+        {"params": patch_embed_params, "lr": 5e-4,           "name": "patch_embed"},
+        {"params": pos_embed_params,   "lr": 5e-4,           "name": "pos_embed"},
+        {"params": attn_params,        "lr": 1e-5,           "name": "attn_blocks"},
+        {"params": decoder_params,     "lr": 1e-3,           "name": "decoder"},
+        {"params": other_params,       "lr": cfg.learning_rate, "name": "other"},
     ]
 
-    trainer.optimizer = optim.AdamW([
-        {"params": patch_embed_params, "lr": 5e-4},
-        {"params": pos_embed_params,   "lr": 5e-4},
-        {"params": attention_params,   "lr": 1e-5},
-        {"params": decoder_params,     "lr": 1e-3},
-        {"params": other_params,       "lr": cfg.learning_rate},
-    ], weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+    counts = {g["name"]: len(g["params"]) for g in param_groups}
+    trainer.logger.info(f"Optimizer strategy B — param groups: {counts}")
+
+    trainer.optimizer = optim.AdamW(
+        param_groups,
+        weight_decay=cfg.weight_decay,
+        betas=(0.9, 0.95),
+    )
 
     _rebuild_scheduler(trainer)
 

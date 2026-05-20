@@ -295,7 +295,7 @@ touching anything on disk.
 | 3b. Prediction category | `pixelspointspolygons.misc.coco_conversions` and `…predictor_pix2poly` | Wraps `generate_coco_ann` to write `category_id=1` into every predicted annotation. |
 | 4. Visualisation | `pixelspointspolygons.misc.shared_utils` and `…trainer_pix2poly` | Replaces `denormalize_image_for_visualization` with `denormalize_s2`, which inverts the Normalize transform then applies a per-channel p2–p98 percentile stretch. Linear rescaling by `max_pixel_value=10000` produces near-black images because S2 reflectance clusters in the bottom 20–30 % of the range; the percentile stretch makes training visualisations readable. |
 | 5. Decoder regularisation | model object, applied after `setup_model()` | `patch_decoder(model)` increases dropout from 0.1 → 0.2 in every `TransformerDecoderLayer` (self-attn, cross-attn, FFN). |
-| 6. Training strategy | optimizer + scheduler, applied after `setup_optimizer()` | Two-phase fine-tuning: phase 1 (`patch_optimizer_frozen`) freezes ViT attention blocks for `FREEZE_EPOCHS` epochs while training everything else; phase 2 (`patch_optimizer_strategy_b`) unfreezes attention with a low LR (1e-5) and rebuilds the scheduler to continue its decay from the current step count. See training strategy below. |
+| 6. Training strategy | optimizer + scheduler, applied after `setup_optimizer()` | Two-phase fine-tuning: phase 1 (`patch_optimizer_frozen`) freezes ViT attention blocks for `FREEZE_EPOCHS` epochs while training everything else; phase 2 (`patch_optimizer_strategy_b`) unfreezes attention with a low LR (1e-5) and restarts the scheduler from warmup. See training strategy below. |
 | 7. Visualization gating | `trainer.visualization`, monkey-patched | The original trainer calls `visualization()` every epoch, which runs the full autoregressive decoder. A wrapper skips it on non-validation epochs, matching the `val_every` cadence. |
 | 8. GT polygon alignment | `pixelspointspolygons.misc.debug_visualisations` and `…trainer_pix2poly` | `plot_image` is replaced with a version that always passes `origin='upper'` and an explicit pixel-aligned `extent` to `imshow`, fixing the GT polygon overlay that was vertically flipped or shifted in some matplotlib environments. |
 | 9. Train IoU logging | CSV writer (`csv.writer` swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 128-image train subset (shuffle=False); the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
@@ -355,9 +355,9 @@ with an extra group at a very low LR:
 | Decoder | 1e-3 |
 | Everything else | `cfg.learning_rate` |
 
-The scheduler is also rebuilt at this point. To avoid the LR resetting to the warmup
-peak, the number of optimizer steps already completed is passed as `last_epoch`, so the
-linear decay continues from where it left off.
+The scheduler is also rebuilt at this point and restarts from warmup. The warmup
+lasts ~5 % of total steps, so the LR spike at the transition is brief and negligible
+on a 100-epoch run.
 
 Set `FREEZE_EPOCHS = 0` to skip phase 1 and start directly with Strategy B.
 

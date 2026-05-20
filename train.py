@@ -165,13 +165,8 @@ def patch_decoder(model):
         layer.self_attn.dropout = 0.2
         layer.multihead_attn.dropout = 0.2
 
-def _rebuild_scheduler(trainer, last_epoch=-1):
-    """Rebuild the warmup-then-linear-decay scheduler on the current optimizer.
-
-    last_epoch: number of optimizer steps already done. Passing -1 (default)
-    restarts the warmup from scratch. Passing the actual step count at the
-    phase-2 transition avoids the LR spiking back to the warmup peak.
-    """
+def _rebuild_scheduler(trainer):
+    """Rebuild the warmup-then-linear-decay scheduler on the current optimizer."""
     sched_keywords = trainer.lr_scheduler.lr_lambdas[0].keywords
     import warnings
     from transformers import get_linear_schedule_with_warmup
@@ -181,7 +176,6 @@ def _rebuild_scheduler(trainer, last_epoch=-1):
             trainer.optimizer,
             num_warmup_steps=sched_keywords["num_warmup_steps"],
             num_training_steps=sched_keywords["num_training_steps"],
-            last_epoch=last_epoch,
         )
 
 
@@ -232,11 +226,10 @@ def patch_optimizer_frozen(trainer):
     trainer.optimizer = optim.AdamW(
         param_groups, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
-    # last_epoch=-1: scheduler starts from step 0 (warmup), correct for phase 1.
-    _rebuild_scheduler(trainer, last_epoch=-1)
+    _rebuild_scheduler(trainer)
 
 
-def patch_optimizer_strategy_b(trainer, last_epoch=-1):
+def patch_optimizer_strategy_b(trainer):
     """Train everything with differentiated learning rates (no freezing).
 
     Parameter group  |  LR
@@ -245,9 +238,6 @@ def patch_optimizer_strategy_b(trainer, last_epoch=-1):
     attn_blocks      |  1e-5   (keep DINO features, just nudge them toward S2)
     decoder          |  1e-3   (freshly initialized, can afford a higher LR)
     other            |  cfg.lr (MLP, norms, etc.)
-
-    last_epoch: pass -1 to start a fresh warmup, or the number of optimizer
-    steps already done to continue the decay curve from the phase-1 transition.
     """
     import torch.optim as optim
     model = trainer.model
@@ -286,7 +276,7 @@ def patch_optimizer_strategy_b(trainer, last_epoch=-1):
         betas=(0.9, 0.95),
     )
 
-    _rebuild_scheduler(trainer, last_epoch=last_epoch)
+    _rebuild_scheduler(trainer)
 
 
 @hydra.main(config_path="./config", config_name="config", version_base="1.3")
@@ -412,12 +402,7 @@ def main(cfg):
                 # Re-enable requires_grad on all parameters.
                 for param in self_inner.model.parameters():
                     param.requires_grad = True
-                # iter_idx is the total number of batches processed so far,
-                # which equals the number of optimizer steps (no grad accum).
-                # Passing it as last_epoch lets the scheduler pick up its
-                # decay curve from the right point instead of restarting.
-                steps_done = iter_idx
-                patch_optimizer_strategy_b(self_inner, last_epoch=steps_done)
+                patch_optimizer_strategy_b(self_inner)
                 # Recompile so the graph includes the newly-trainable parameters.
                 self_inner.model = torch.compile(self_inner.model, mode="default")
 

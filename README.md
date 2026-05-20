@@ -245,7 +245,7 @@ Key parameters:
 | `batch_size` | 4 | in `run_type/ai4smallfarms.yaml` |
 | `learning_rate` | decoder 1e-3, patch/pos embed 5e-4, other 3e-4 | per-group AdamW — see training strategy below |
 | `num_epochs` | 100 | |
-| `val_every` | 5 | IoU evaluated every 5 epochs |
+| `val_every` | 10 | IoU evaluated every 10 epochs |
 
 The Sentinel-2 normalisation is currently set to identity (mean=0, std=1,
 max_pixel=10000) in `config/encoder/vit_s2.yaml`. Update with per-dataset per-channel
@@ -295,7 +295,10 @@ touching anything on disk.
 | 3b. Prediction category | `pixelspointspolygons.misc.coco_conversions` and `…predictor_pix2poly` | Wraps `generate_coco_ann` to write `category_id=1` into every predicted annotation. |
 | 4. Visualisation | `pixelspointspolygons.misc.shared_utils` and `…trainer_pix2poly` | Replaces `denormalize_image_for_visualization` with `denormalize_s2`, which inverts the Normalize transform then applies a per-channel p2–p98 percentile stretch. Linear rescaling by `max_pixel_value=10000` produces near-black images because S2 reflectance clusters in the bottom 20–30 % of the range; the percentile stretch makes training visualisations readable. |
 | 5. Decoder regularisation | model object, applied after `setup_model()` | `patch_decoder(model)` increases dropout from 0.1 → 0.2 in every `TransformerDecoderLayer` (self-attn, cross-attn, FFN). |
-| 6. Training strategy | optimizer + scheduler, applied after `setup_optimizer()` | `patch_optimizer_strategy_a` freezes all ViT attention blocks (`model.encoder.vit.blocks`) and replaces the single-LR AdamW with per-group rates (see training strategy below). Rebuilds the warmup–linear-decay scheduler on the new optimiser. |
+| 6. Training strategy | optimizer + scheduler, applied after `setup_optimizer()` | Two-phase fine-tuning: phase 1 (`patch_optimizer_frozen`) freezes ViT attention blocks for `FREEZE_EPOCHS` epochs while training everything else; phase 2 (`patch_optimizer_strategy_b`) unfreezes attention with a low LR (1e-5) and rebuilds the scheduler to continue its decay from the current step count. See training strategy below. |
+| 7. Visualization gating | `trainer.visualization`, monkey-patched | The original trainer calls `visualization()` every epoch, which runs the full autoregressive decoder. A wrapper skips it on non-validation epochs, matching the `val_every` cadence. |
+| 8. GT polygon alignment | `pixelspointspolygons.misc.debug_visualisations` and `…trainer_pix2poly` | `plot_image` is replaced with a version that always passes `origin='upper'` and an explicit pixel-aligned `extent` to `imshow`, fixing the GT polygon overlay that was vertically flipped or shifted in some matplotlib environments. |
+| 9. Train IoU logging | CSV writer (`csv.writer` swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 128-image train subset (shuffle=False); the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
 
 Nothing in the installed package is touched on disk.
 
@@ -320,29 +323,29 @@ strict=False)`.
 
 ### Training strategy
 
-Two strategies are defined in `train.py`. Switch between them by changing one line in
-`patched_train`: `patch_optimizer_strategy_a(self)` or `patch_optimizer_strategy_b(self)`.
+The current approach is a two-phase schedule controlled by `FREEZE_EPOCHS` in `train.py`.
 
-**Strategy A — freeze attention, train patch embed + decoder**
+**Phase 1 — freeze attention, train patch embed + decoder** (`patch_optimizer_frozen`)
 
-`patch_optimizer_strategy_a` freezes all ViT attention blocks
-(`model.encoder.vit.blocks`) and replaces the single-LR AdamW with per-group rates:
+For the first `FREEZE_EPOCHS` epochs only the `.attn.` parameters inside
+`encoder.vit.blocks` are frozen (Q, K, V and output projection). MLP layers, layer
+norms, `patch_embed`, `pos_embed` and the decoder are trained from the start.
 
 | Parameter group | Learning rate |
 |-----------------|--------------|
 | `patch_embed` | 5e-4 |
 | `pos_embed` | 5e-4 |
 | Decoder | 1e-3 |
-| Everything else (not frozen) | 3e-4 |
+| Everything else (MLP, norms, …) | `cfg.learning_rate` |
 
-Rationale: DINO features are strong general-purpose representations; freezing attention
-avoids catastrophic forgetting. The downside is that with S2 32×32 input (very different
-from the ImageNet 224×224 distribution DINO was trained on), the encoder features may
-remain poorly adapted and the decoder stagnates near random loss.
+Rationale: DINO attention features are pretrained on ImageNet 224×224 RGB; freezing
+them in the first few epochs lets the new patch embedding and decoder warm up before
+the encoder weights are exposed to gradient updates.
 
-**Strategy B — train everything with separate LRs**
+**Phase 2 — train everything with separate LRs** (`patch_optimizer_strategy_b`)
 
-`patch_optimizer_strategy_b` unfreezes all blocks and adds a low LR group for attention:
+At epoch `FREEZE_EPOCHS` the attention blocks are unfrozen and the optimizer is rebuilt
+with an extra group at a very low LR:
 
 | Parameter group | Learning rate |
 |-----------------|--------------|
@@ -350,13 +353,15 @@ remain poorly adapted and the decoder stagnates near random loss.
 | `pos_embed` | 5e-4 |
 | Attention blocks | 1e-5 |
 | Decoder | 1e-3 |
-| Everything else | 3e-4 |
+| Everything else | `cfg.learning_rate` |
 
-Recommended when Strategy A stagnates (train loss stays near `log(vocab_size) ≈ 3.56`)
-because the frozen encoder cannot adapt to Sentinel-2 reflectance values.
+The scheduler is also rebuilt at this point. To avoid the LR resetting to the warmup
+peak, the number of optimizer steps already completed is passed as `last_epoch`, so the
+linear decay continues from where it left off.
 
-The warmup–linear-decay scheduler (5 % warmup) is rebuilt on the new optimiser after
-the swap in both strategies.
+Set `FREEZE_EPOCHS = 0` to skip phase 1 and start directly with Strategy B.
+
+The warmup–linear-decay scheduler uses a 5 % warmup in both phases.
 
 ### Training optimisations
 
@@ -383,7 +388,10 @@ tail -f train_ai4smallfarms.log
 ```
 
 Each epoch appends a row to `metrics.csv`: `epoch`, `train_loss`, `val_loss`,
-`val_iou` (computed every 5 epochs). `val_iou` is used for best-checkpoint selection.
+`val_iou`, `train_iou`. Both IoU columns are computed every `val_every` epochs
+(default: 10); other epochs write `nan`. `val_iou` is used for best-checkpoint
+selection. `train_iou` is estimated on a fixed 128-image subset of the training set
+(shuffle=False) so the same patches are used every evaluation.
 
 ```bash
 # Auto-detect the latest run:

@@ -22,7 +22,7 @@ Sentinel-2 is 10 m/pixel, 3-band uint16. That gap creates several concrete probl
 |---------|------------|-----|
 | Much larger fields at 10 m/px | Patches with hundreds of vertices exceed `max_num_vertices` | Reduced patch size to 32×32; set `max_num_vertices` to 384 (only 1.1 % of patches exceed this) |
 | uint16 reflectance values | Default normalisation assumes uint8 | Custom `denormalize_s2` patched at runtime |
-| ViT expects 224×224 input | Shape mismatch when loading pretrained weights | Pretrained positional embeddings discarded; relearned from scratch on 32×32 |
+| ViT expects 224×224 input | Shape mismatch when loading pretrained weights | Both `patch_embed` and `pos_embed` discarded; relearned from scratch on 32×32 |
 | NumPy ≥ 2.0 in base env | `torch.from_numpy()` raises `RuntimeError` | Dedicated `ai4sf` conda env pinned to NumPy 1.26.4 |
 | Evaluator hard-codes category 100 (building) | IoU evaluated against wrong category | Evaluator and predictor patched to use category id=1 (field) |
 
@@ -240,7 +240,7 @@ Key parameters:
 | `max_num_vertices` | 384 | total vertices across all polygons in one patch; ~1.1 % of patches exceed this and are dropped at load time |
 | `max_len` | 770 | 384 × 2 coords + BOS + EOS, computed at runtime |
 | `generation_steps` | 770 | matches `max_len` |
-| `backbone` | ViT-S/2 DINO | positional embeddings reinitialised from scratch |
+| `backbone` | ViT-S/2 DINO | `patch_embed` and `pos_embed` reinitialised from scratch; attention weights loaded from DINO |
 | `augmentations` | D4 + Normalize | 8-fold dihedral group (rotations 0°/90°/180°/270° + reflections) |
 | `batch_size` | 4 | in `run_type/ai4smallfarms.yaml` |
 | `learning_rate` | decoder 1e-3, patch/pos embed 5e-4, other 3e-4 | per-group AdamW — see training strategy below |
@@ -296,9 +296,8 @@ touching anything on disk.
 | 4. Visualisation | `pixelspointspolygons.misc.shared_utils` and `…trainer_pix2poly` | Replaces `denormalize_image_for_visualization` with `denormalize_s2`, which inverts the Normalize transform then applies a per-channel p2–p98 percentile stretch. Linear rescaling by `max_pixel_value=10000` produces near-black images because S2 reflectance clusters in the bottom 20–30 % of the range; the percentile stretch makes training visualisations readable. |
 | 5. Decoder regularisation | model object, applied after `setup_model()` | `patch_decoder(model)` increases dropout from 0.1 → 0.2 in every `TransformerDecoderLayer` (self-attn, cross-attn, FFN). |
 | 6. Training strategy | optimizer + scheduler, applied after `setup_optimizer()` | Two-phase fine-tuning: phase 1 (`patch_optimizer_frozen`) freezes ViT attention blocks for `FREEZE_EPOCHS` epochs while training everything else; phase 2 (`patch_optimizer_strategy_b`) unfreezes attention with a low LR (1e-5) and restarts the scheduler from warmup. See training strategy below. |
-| 7. Visualization gating | `trainer.visualization`, monkey-patched | The original trainer calls `visualization()` every epoch, which runs the full autoregressive decoder. A wrapper skips it on non-validation epochs, matching the `val_every` cadence. |
-| 8. GT polygon alignment | `pixelspointspolygons.misc.debug_visualisations` and `…trainer_pix2poly` | `plot_image` is replaced with a version that always passes `origin='upper'` and an explicit pixel-aligned `extent` to `imshow`, fixing the GT polygon overlay that was vertically flipped or shifted in some matplotlib environments. |
-| 9. Train IoU logging | CSV writer (`csv.writer` swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 128-image train subset (shuffle=False); the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
+| 7. Visualization | `trainer.visualization`, replaced entirely | The original `visualization()` is replaced with a version that (a) skips non-validation epochs to avoid running the full autoregressive decoder every epoch, and (b) draws GT polygons from raw `coco.imgToAnns` pixel-space coordinates instead of decoded tokens. Token-decoded coordinates live in `[0, num_bins-1]` (0–31 for 32×32 patches) and match the image, but reconstruction through the tokenizer loses precision; raw COCO annotations are exact. |
+| 8. Train IoU logging | CSV writer (`csv.writer` swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 128-image train subset (shuffle=False); the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
 
 Nothing in the installed package is touched on disk.
 
@@ -319,7 +318,9 @@ strict=False)`.
 |-----------|---------------|
 | `patch_embed` (2×2 conv) | Random — kernel shape changed from 8×8, incompatible |
 | `pos_embed` (257 positions) | Random — grid changed from 28×28 to 16×16 |
-| Attention weights, MLP, layer norms | Loaded from DINO — kept frozen during training |
+| Attention weights | Loaded from DINO — frozen during phase 1, fine-tuned at 1e-5 in phase 2 |
+| MLP layers, layer norms | Loaded from DINO — trained from epoch 0 |
+| Decoder (transformer + prediction heads) | Random — freshly initialised, not part of the DINO checkpoint |
 
 ### Training strategy
 
@@ -338,14 +339,15 @@ norms, `patch_embed`, `pos_embed` and the decoder are trained from the start.
 | Decoder | 1e-3 |
 | Everything else (MLP, norms, …) | `cfg.learning_rate` |
 
-Rationale: DINO attention features are pretrained on ImageNet 224×224 RGB; freezing
-them in the first few epochs lets the new patch embedding and decoder warm up before
-the encoder weights are exposed to gradient updates.
+Rationale: DINO attention features are pretrained on ImageNet 224×224 RGB; freezing them for the first few epochs lets the randomly initialised patch embedding, positional embedding, and decoder warm up before the encoder attention weights are exposed to gradient updates.
 
 **Phase 2 — train everything with separate LRs** (`patch_optimizer_strategy_b`)
 
-At epoch `FREEZE_EPOCHS` the attention blocks are unfrozen and the optimizer is rebuilt
-with an extra group at a very low LR:
+At epoch `FREEZE_EPOCHS` the attention blocks are unfrozen, `requires_grad` is
+re-enabled on all parameters, and the optimizer is rebuilt with an extra group at a
+very low LR. The model is **not** recompiled: `torch.compile` was applied once in
+`train_val_loop`, and TorchDynamo recompiles automatically on the next forward when
+`requires_grad` changes.
 
 | Parameter group | Learning rate |
 |-----------------|--------------|
@@ -440,8 +442,9 @@ The evaluator category patch wasn't applied. Make sure you are launching with
 
 **`val_iou` is always NaN / "No polygons predicted"**  
 The model has not converged yet — train loss must fall well below `log(vocab_size) ≈
-3.56` before EOS tokens appear in predictions. With Strategy A, convergence can be very
-slow. Switch to Strategy B or use the full dataset.
+3.56` before EOS tokens appear in predictions. Convergence is slow in the first
+`FREEZE_EPOCHS` epochs while attention is frozen; IoU typically starts appearing
+after the phase-2 transition.
 
 **Training visualisations are very dark / near-black**  
 `denormalize_s2` is not being applied. Confirm that the `shared_utils` and

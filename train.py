@@ -1,27 +1,23 @@
+"""
+AI4SmallFarms training script.
+Patches applied at runtime – the PixelsPointsPolygons package is not modified.
+"""
 import sys
 import os
 import numpy as np
 
-# All AI4SmallFarms-specific patches go here. Nothing in the installed
-# PixelsPointsPolygons package is ever touched on disk — everything is
-# replaced at runtime via Python's module reference system.
+# --------------------------------------------------------------------
+# Configurable constants
+# --------------------------------------------------------------------
+FREEZE_EPOCHS = 10       # number of epochs with ViT attention frozen
+TRAIN_IOU_SUBSET = 128   # fixed subset size for train_iou estimate
+
+# --------------------------------------------------------------------
+# 1. Module / object replacements
+# --------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Two-phase fine-tuning schedule.
-# Phase 1 (epochs 0 … FREEZE_EPOCHS-1): only the ViT attention weights are
-# frozen (Q/K/V + projection). patch_embed, pos_embed, MLP layers, norms and
-# the decoder are trained normally from the start.
-# Phase 2 (epoch FREEZE_EPOCHS onward): attention unfrozen, optimizer rebuilt
-# with differentiated LRs (Strategy B), model recompiled.
-# Set FREEZE_EPOCHS = 0 to skip phase 1 and go straight to Strategy B.
-FREEZE_EPOCHS = 10   # roughly 10 % of a 100-epoch run — tune as needed
-
-# How many train images to use for the train_iou estimate every val_every
-# epochs. A fixed subset (shuffle=False) so we compare the same images
-# across epochs rather than a random sample.
-TRAIN_IOU_SUBSET = 128
-
-# 1. p3_coco safety patch
+# 1a. Custom dataset (p3_coco)
 import p3_coco as local_p3_coco
 import pixelspointspolygons.datasets.p3_coco as pkg_p3_coco
 pkg_p3_coco.P3Dataset   = local_p3_coco.P3Dataset
@@ -29,19 +25,21 @@ pkg_p3_coco.TrainDataset = local_p3_coco.TrainDataset
 pkg_p3_coco.ValDataset  = local_p3_coco.ValDataset
 pkg_p3_coco.TestDataset = local_p3_coco.TestDataset
 
-# 2. Fix missing cv2 import in build_datasets
+# 1b. Missing cv2 in build_datasets
 import cv2
 import pixelspointspolygons.datasets.build_datasets as build_datasets_module
 build_datasets_module.cv2 = cv2
 
-# 3. ViT interpolation patch (64x64)
+# 1c. Custom ViT for 32×32 input
 import modified_vit
 import pixelspointspolygons.models.vision_transformer as vit_module
 vit_module.ViT = modified_vit.ViT
 import pixelspointspolygons.models.pix2poly.model_pix2poly as model_pix2poly_module
 model_pix2poly_module.ViT = modified_vit.ViT
 
-# 4. Patch evaluator category for AI4SmallFarms (field = 1, not building 100)
+# --------------------------------------------------------------------
+# 2. COCO evaluator and prediction patches (field category = 1)
+# --------------------------------------------------------------------
 from copy import deepcopy
 from pycocotools.cocoeval import COCOeval
 import pixelspointspolygons.eval.evaluator as eval_module
@@ -49,7 +47,7 @@ import pixelspointspolygons.eval.evaluator as eval_module
 original_compute_coco = eval_module.Evaluator.compute_coco_metrics
 def patched_compute_coco(self, annType='segm'):
     cocoEval = COCOeval(deepcopy(self.cocoGt), deepcopy(self.cocoDt), iouType=annType)
-    cocoEval.params.catIds = [1]          # field category
+    cocoEval.params.catIds = [1]          # field
     cocoEval.evaluate()
     cocoEval.accumulate()
     cocoEval.summarize()
@@ -63,7 +61,7 @@ def patched_compute_coco(self, annType='segm'):
     }
 eval_module.Evaluator.compute_coco_metrics = patched_compute_coco
 
-# Fix category_id in predictions (field=1, not building=100)
+# Force category_id = 1 in all COCO predictions
 import pixelspointspolygons.misc.coco_conversions as coco_conv_module
 original_generate_coco_ann = coco_conv_module.generate_coco_ann
 
@@ -74,34 +72,24 @@ def patched_generate_coco_ann(polygon_list, img_id, scores=None):
     return anns
 
 coco_conv_module.generate_coco_ann = patched_generate_coco_ann
-# Also patch the reference imported in predictor_pix2poly
 import pixelspointspolygons.predict.predictor_pix2poly as pred_module
 pred_module.generate_coco_ann = patched_generate_coco_ann
 
-# 5. Fix visualization for Sentinel-2 uint16 images
+# --------------------------------------------------------------------
+# 3. Sentinel-2 visualisation (percentile stretch denormalisation)
+# --------------------------------------------------------------------
 import pixelspointspolygons.misc.shared_utils as shared_utils
 
-original_denorm = shared_utils.denormalize_image_for_visualization
-
 def denormalize_s2(image, cfg):
-    """Convert a normalized S2 tensor back to a displayable uint8 image.
-
-    The standard linear /max_pixel rescaling produces near-black images because
-    S2 reflectance values cluster in the bottom 20-30% of the uint16 range.
-    Using a per-channel p2-p98 percentile stretch makes the visualizations
-    actually readable without touching the training normalization.
-    """
+    """De-normalise S2 tensor to uint8 via p2-p98 percentile stretch."""
     image = image.detach().cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
     mean = np.array(cfg.experiment.encoder.image_mean)
     std  = np.array(cfg.experiment.encoder.image_std)
     max_pixel = cfg.experiment.encoder.image_max_pixel_value
 
-    # Inverse of Normalize: pixel = (value * std + mean) * max_pixel
-    image = image * std + mean
-    image = image * max_pixel
+    image = (image * std + mean) * max_pixel
     image = np.clip(image, 0, max_pixel)
 
-    # Per-channel percentile stretch so dark S2 imagery becomes visible
     out = np.zeros_like(image, dtype=np.uint8)
     for c in range(image.shape[2]):
         lo, hi = np.percentile(image[:, :, c], [2, 98])
@@ -112,61 +100,34 @@ def denormalize_s2(image, cfg):
     return out
 
 shared_utils.denormalize_image_for_visualization = denormalize_s2
-# ============================================
+
+# --------------------------------------------------------------------
+# 4. Import remaining helpers (Hydra, trainer, etc.)
+# --------------------------------------------------------------------
 import types
 import hydra
 from pixelspointspolygons.train import Pix2PolyTrainer
 from pixelspointspolygons.misc.shared_utils import setup_ddp, setup_hydraconf
 
-# Patch trainer for visualisation
 import pixelspointspolygons.train.trainer_pix2poly as trainer_module
 trainer_module.denormalize_image_for_visualization = denormalize_s2
 
-# Fix GT polygon misalignment in saved visualization PNGs.
-# Two things were wrong:
-#   1. ax.imshow() without an explicit origin= falls back to rcParams, which
-#      can be 'lower' depending on the matplotlib install.  That flips the
-#      Y-axis and makes the polygon overlays appear vertically mirrored.
-#   2. Vertices decoded from tokens can reach exactly `width` or `height`
-#      (the dequantize of the last bin), which falls outside the default
-#      imshow extent and gets clipped at the border.
-# The fix is to always pass origin='upper' and set the extent explicitly so
-# the image pixel grid and the polygon coordinate system agree exactly.
-import pixelspointspolygons.misc.debug_visualisations as _dbgviz
-
-_original_plot_image = _dbgviz.plot_image
-
-def _patched_plot_image(image, ax=None, show_axis=False, show=False):
-    import torch, numpy as np, matplotlib.pyplot as plt
-    if isinstance(image, torch.Tensor):
-        image = image.permute(1, 2, 0).cpu().numpy()
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(5, 5), dpi=50)
-    ax.axis(show_axis)
-    h, w = image.shape[:2]
-    # origin='upper' locks row-0 to the top regardless of rcParams.
-    # The half-pixel margin in extent keeps vertices at exactly w or h
-    # from being clipped at the image border.
-    ax.imshow(image, origin='upper', extent=[-0.5, w - 0.5, h - 0.5, -0.5])
-    if show:
-        plt.show(block=False)
-
-_dbgviz.plot_image = _patched_plot_image
-# Also patch the reference already imported in trainer_pix2poly
-trainer_module.plot_image = _patched_plot_image
-
-
+# --------------------------------------------------------------------
+# 5. Decoder patch (higher dropout)
+# --------------------------------------------------------------------
 def patch_decoder(model):
-    """Increase decoder dropout to 0.2 (was 0.1) to reduce overfitting on the small dataset."""
+    """Increase decoder dropout from 0.1 to 0.2 for regularisation."""
     dec = model.decoder
-
     for layer in dec.decoder.layers:
         layer.dropout.p = 0.2
         layer.self_attn.dropout = 0.2
         layer.multihead_attn.dropout = 0.2
 
+# --------------------------------------------------------------------
+# 6. Optimiser & scheduler utilities
+# --------------------------------------------------------------------
 def _rebuild_scheduler(trainer):
-    """Rebuild the warmup-then-linear-decay scheduler on the current optimizer."""
+    """Replace the current scheduler with a fresh one tied to trainer.optimizer."""
     sched_keywords = trainer.lr_scheduler.lr_lambdas[0].keywords
     import warnings
     from transformers import get_linear_schedule_with_warmup
@@ -178,27 +139,18 @@ def _rebuild_scheduler(trainer):
             num_training_steps=sched_keywords["num_training_steps"],
         )
 
-
 def patch_optimizer_frozen(trainer):
-    """Set up the phase-1 optimizer: freeze ViT attention, train everything else.
-
-    I only freeze the '.attn.' parameters inside encoder.vit.blocks (Q, K, V
-    and output projection). MLP layers, layer norms, patch_embed, pos_embed
-    and the decoder all stay trainable from epoch 0. The idea is to preserve
-    DINO attention weights while the new patch embedding and decoder warm up.
-    """
+    """Phase 1: freeze ViT attention (Q,K,V,proj), train everything else."""
     import torch.optim as optim
     model = trainer.model
     cfg   = trainer.cfg.experiment.model
 
-    # Freeze only attention parameters inside ViT blocks.
     frozen_count = 0
     for name, param in model.encoder.vit.blocks.named_parameters():
         if ".attn." in name:
             param.requires_grad = False
             frozen_count += 1
 
-    # Build param groups identical to Strategy B but without the frozen attn group.
     patch_embed_params, pos_embed_params, decoder_params, other_params = [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -218,27 +170,17 @@ def patch_optimizer_frozen(trainer):
         {"params": decoder_params,     "lr": 1e-3, "name": "decoder"},
         {"params": other_params,       "lr": cfg.learning_rate, "name": "other"},
     ]
-    counts = {g["name"]: len(g["params"]) for g in param_groups}
     trainer.logger.info(
-        f"Phase-1 optimizer (attn blocks frozen: {frozen_count} tensors) "
-        f"— param groups: {counts}"
+        f"Phase-1 optimiser (attn frozen: {frozen_count} tensors) "
+        f"— groups: { {g['name']: len(g['params']) for g in param_groups} }"
     )
     trainer.optimizer = optim.AdamW(
         param_groups, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
     _rebuild_scheduler(trainer)
 
-
 def patch_optimizer_strategy_b(trainer):
-    """Train everything with differentiated learning rates (no freezing).
-
-    Parameter group  |  LR
-    patch_embed      |  5e-4   (has to learn new 2x2 conv for 32px input)
-    pos_embed        |  5e-4   (was discarded at checkpoint load, learned from scratch)
-    attn_blocks      |  1e-5   (keep DINO features, just nudge them toward S2)
-    decoder          |  1e-3   (freshly initialized, can afford a higher LR)
-    other            |  cfg.lr (MLP, norms, etc.)
-    """
+    """Phase 2: train all parameters with differentiated learning rates."""
     import torch.optim as optim
     model = trainer.model
     cfg = trainer.cfg.experiment.model
@@ -260,41 +202,35 @@ def patch_optimizer_strategy_b(trainer):
             other_params.append(param)
 
     param_groups = [
-        {"params": patch_embed_params, "lr": 5e-4,           "name": "patch_embed"},
-        {"params": pos_embed_params,   "lr": 5e-4,           "name": "pos_embed"},
-        {"params": attn_params,        "lr": 1e-5,           "name": "attn_blocks"},
-        {"params": decoder_params,     "lr": 1e-3,           "name": "decoder"},
+        {"params": patch_embed_params, "lr": 5e-4, "name": "patch_embed"},
+        {"params": pos_embed_params,   "lr": 5e-4, "name": "pos_embed"},
+        {"params": attn_params,        "lr": 1e-5, "name": "attn_blocks"},
+        {"params": decoder_params,     "lr": 1e-3, "name": "decoder"},
         {"params": other_params,       "lr": cfg.learning_rate, "name": "other"},
     ]
 
-    counts = {g["name"]: len(g["params"]) for g in param_groups}
-    trainer.logger.info(f"Optimizer strategy B — param groups: {counts}")
-
-    trainer.optimizer = optim.AdamW(
-        param_groups,
-        weight_decay=cfg.weight_decay,
-        betas=(0.9, 0.95),
+    trainer.logger.info(
+        f"Strategy B optimiser — groups: { {g['name']: len(g['params']) for g in param_groups} }"
     )
-
+    trainer.optimizer = optim.AdamW(
+        param_groups, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+    )
     _rebuild_scheduler(trainer)
 
-
+# --------------------------------------------------------------------
+# 7. Main entry point
+# --------------------------------------------------------------------
 @hydra.main(config_path="./config", config_name="config", version_base="1.3")
 def main(cfg):
     setup_hydraconf(cfg)
     local_rank, world_size = setup_ddp(cfg)
 
-    if cfg.experiment.model.name == "pix2poly":
-        trainer = Pix2PolyTrainer(cfg, local_rank, world_size)
-    else:
+    if cfg.experiment.model.name != "pix2poly":
         raise ValueError(f"Unknown model name: {cfg.experiment.model.name}")
+    trainer = Pix2PolyTrainer(cfg, local_rank, world_size)
 
-    # trainer.model doesn't exist yet at this point — it gets built inside
-    # trainer.train(). Overriding train() lets the patches hook in right
-    # after setup_model() and setup_optimizer() have both run.
     def patched_train(self):
-        import json, csv
-        import torch
+        import json, os, csv, torch
         from functools import partial
         from torch.utils.data import DataLoader, Subset
         from pixelspointspolygons.misc import seed_everything
@@ -310,17 +246,13 @@ def main(cfg):
 
         patch_decoder(self.model)
 
-        # Phase-1 setup: freeze attention or go straight to Strategy B.
+        # ----- Phase-1 (frozen attention) or directly Strategy B -----
         if FREEZE_EPOCHS > 0:
             patch_optimizer_frozen(self)
         else:
             patch_optimizer_strategy_b(self)
 
-        # Build a dedicated loader for the periodic train_iou estimate.
-        # train_viz_loader is not reused here because it may have fewer images.
-        # Using val-style transforms (no augmentation) so the predictor input
-        # matches inference conditions. shuffle=False keeps the same images
-        # every val_every epochs for a fair comparison across runs.
+        # ----- Build fixed train_iou loader (val transforms, no augmentation) -----
         import albumentations as A
         from albumentations.pytorch import ToTensorV2
         from pixelspointspolygons.datasets.p3_coco import TrainDataset as _TrainDS
@@ -334,24 +266,19 @@ def main(cfg):
                 )
             if "Normalize" in self.cfg.experiment.encoder.augmentations:
                 _viz_transforms_list.append(
-                    A.Normalize(
-                        mean=self.cfg.experiment.encoder.image_mean,
-                        std=self.cfg.experiment.encoder.image_std,
-                        max_pixel_value=self.cfg.experiment.encoder.image_max_pixel_value,
-                    )
+                    A.Normalize(mean=self.cfg.experiment.encoder.image_mean,
+                                std=self.cfg.experiment.encoder.image_std,
+                                max_pixel_value=self.cfg.experiment.encoder.image_max_pixel_value)
                 )
         _viz_transforms_list.append(ToTensorV2())
         _iou_transform = A.ReplayCompose(
             transforms=_viz_transforms_list,
-            keypoint_params=A.KeypointParams(format='yx', remove_invisible=False),
+            keypoint_params=A.KeypointParams(format='yx', remove_invisible=False)
         )
 
-        _full_train_ds = _TrainDS(self.cfg, transform=_iou_transform,
-                                  tokenizer=self.tokenizer)
+        _full_train_ds = _TrainDS(self.cfg, transform=_iou_transform, tokenizer=self.tokenizer)
         _n_iou = min(TRAIN_IOU_SUBSET, len(_full_train_ds))
         _iou_subset = Subset(_full_train_ds, list(range(_n_iou)))
-        # The Subset wrapper drops dataset-level attributes; copy them over
-        # so predict_from_loader and the Evaluator can still find them.
         _iou_subset.ann_file = _full_train_ds.ann_file
         _iou_subset.coco     = _full_train_ds.coco
         _iou_subset.split    = _full_train_ds.split
@@ -364,57 +291,163 @@ def main(cfg):
             num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.run_type.name != 'debug',
             drop_last=False,
-            shuffle=False,   # fixed subset — must not shuffle
+            shuffle=False,
         )
         self.logger.info(
-            f"train_iou_loader: {_n_iou} images "
-            f"(first {_n_iou} of train set, shuffle=False)"
+            f"train_iou_loader: {_n_iou} images (first {_n_iou} of train set, shuffle=False)"
         )
 
-        # Gate visualization() to val_every epochs.
-        # The original trainer calls visualization() every single epoch
-        # (trainer_pix2poly.py line 504), which runs the full autoregressive
-        # decoder — same cost as COCO eval. Skipping it on non-val epochs
-        # noticeably speeds up training without losing useful information.
-        _original_visualization = self.visualization.__func__  # unbound
+        # ----- Replace visualization: use raw COCO GT, skip non‑val epochs -----
+        from collections import defaultdict
+        from shapely.geometry import Polygon as _ShapelyPolygon
+        import matplotlib.pyplot as _plt
+        import wandb as _wandb
+        from pixelspointspolygons.misc.shared_utils import (
+            denormalize_image_for_visualization as _denorm,
+            get_tile_names_from_dataloader as _get_tile_names,
+        )
+        from pixelspointspolygons.misc.debug_visualisations import (
+            plot_image as _plot_image,
+            plot_point_cloud as _plot_point_cloud,
+            plot_shapely_polygons as _plot_shapely_polygons,
+        )
+        from pixelspointspolygons.misc.coco_conversions import (
+            coco_anns_to_shapely_polys as _coco_anns_to_shapely_polys,
+            tensor_to_shapely_polys as _tensor_to_shapely_polys,
+        )
 
-        def _gated_visualization(self_inner, loader, epoch, **kwargs):
+        def _patched_visualization(self_inner, loader, epoch, predictor, coco_anns=None, num_images=2):
             if (epoch + 1) % self_inner.cfg.training.val_every != 0:
-                return  # skip — not a validation epoch
-            _original_visualization(self_inner, loader, epoch, **kwargs)
+                return
 
-        self.visualization = types.MethodType(_gated_visualization, self)
+            self_inner.model.eval()
 
-        # Wrap train_one_epoch to inject the freeze→unfreeze transition.
-        # At epoch FREEZE_EPOCHS: unfreeze attention, rebuild optimizer with
-        # Strategy B, recompile the model.
-        # GradScaler is intentionally not rebuilt: it lives for the full run
-        # and resetting it at this point would reset the scale factor that has
-        # already been adjusted to the gradient magnitudes.
-        _original_train_one_epoch = self.train_one_epoch.__func__  # unbound
+            ds = loader.dataset
+            coco_obj = getattr(ds, 'coco', getattr(getattr(ds, 'dataset', None), 'coco', None))
+
+            # Find the batch with the most polygons
+            best_batch, best_count = None, -1
+            for _viz_batch in loader:
+                _eos = (_viz_batch[2] == self_inner.tokenizer.EOS_code).float().argmax(dim=-1)
+                _n   = int((_eos > 1).sum().item())
+                if _n > best_count:
+                    best_count = _n
+                    best_batch = _viz_batch
+                if _n >= num_images:
+                    break
+            x_image, x_lidar, y_sequence, y_perm, tile_ids = best_batch
+
+            _eos   = (y_sequence == self_inner.tokenizer.EOS_code).float().argmax(dim=-1)
+            _has   = (_eos > 1).nonzero(as_tuple=True)[0].tolist()
+            _empty = (_eos <= 1).nonzero(as_tuple=True)[0].tolist()
+            _sel   = (_has + _empty)[:num_images]
+            x_image    = x_image[_sel]
+            y_sequence = y_sequence[_sel]
+            y_perm     = y_perm[_sel]
+            tile_ids   = tile_ids[_sel]
+
+            if self_inner.cfg.experiment.encoder.use_images:
+                x_image = x_image.to(self_inner.cfg.host.device, non_blocking=True)
+            if self_inner.cfg.experiment.encoder.use_lidar:
+                x_lidar = x_lidar.to(self_inner.cfg.host.device, non_blocking=True)
+                x_lidar = list(x_lidar.unbind())[:num_images]
+                x_lidar = torch.nested.nested_tensor(x_lidar, layout=torch.jagged)
+
+            split   = loader.dataset.split
+            outpath = os.path.join(self_inner.cfg.output_dir, "visualizations", split)
+            os.makedirs(outpath, exist_ok=True)
+            self_inner.logger.info(f"Save visualizations to {outpath}")
+
+            if coco_anns is not None:
+                coco_anns_dict = defaultdict(list)
+                for ann in coco_anns:
+                    if ann["image_id"] >= num_images:
+                        break
+                    coco_anns_dict[ann["image_id"]].append(ann)
+
+            if predictor is not None:
+                predicted_polygons = predictor.batch_to_polygons(
+                    x_image, x_lidar, self_inner.model, self_inner.tokenizer
+                )
+                if coco_obj is not None:
+                    gt_polygons = []
+                    for img_id in tile_ids.view(-1).tolist():
+                        img_info = coco_obj.imgs[int(img_id)]
+                        W, H = img_info['width'], img_info['height']
+                        polys = []
+                        for ann in coco_obj.imgToAnns.get(int(img_id), []):
+                            for seg in ann.get('segmentation', []):
+                                pts = np.array(seg).reshape(-1, 2)
+                                pts[:, 0] = np.clip(pts[:, 0], 0, W - 1e-6)
+                                pts[:, 1] = np.clip(pts[:, 1], 0, H - 1e-6)
+                                if len(pts) > 2:
+                                    polys.append(_ShapelyPolygon(pts))
+                        gt_polygons.append(polys)
+                else:
+                    gt_polygons = [
+                        _tensor_to_shapely_polys(p)
+                        for p in predictor.coord_and_perm_to_polygons(y_sequence, y_perm)
+                    ]
+
+            if self_inner.cfg.experiment.encoder.use_lidar:
+                lidar_batches = torch.unbind(x_lidar, dim=0)
+
+            names = _get_tile_names(loader, tile_ids.cpu().numpy().flatten().tolist())
+
+            for i in range(num_images):
+                fig, ax = _plt.subplots(1, 2, figsize=(8, 4), dpi=150)
+                ax = ax.flatten()
+
+                if self_inner.cfg.experiment.encoder.use_images:
+                    image = _denorm(x_image[i], self_inner.cfg)
+                    _plot_image(image, ax=ax[0])
+                    _plot_image(image, ax=ax[1])
+                if self_inner.cfg.experiment.encoder.use_lidar:
+                    _plot_point_cloud(lidar_batches[i], ax=ax[0])
+                    _plot_point_cloud(lidar_batches[i], ax=ax[1])
+
+                coco_polys = _coco_anns_to_shapely_polys(coco_anns_dict[tile_ids[i].item()]) if coco_anns is not None else []
+                if predictor is not None:
+                    pred_polys = _tensor_to_shapely_polys(predicted_polygons[i])
+                    gt_polys   = gt_polygons[i]
+                else:
+                    pred_polys, gt_polys = [], []
+
+                if gt_polys:
+                    _plot_shapely_polygons(gt_polys, ax=ax[0])
+                if pred_polys and not coco_polys:
+                    _plot_shapely_polygons(pred_polys, ax=ax[1])
+                if coco_polys:
+                    _plot_shapely_polygons(coco_polys, ax=ax[1])
+
+                ax[0].set_title(f"GT_{split}_" + names[i])
+                ax[1].set_title(f"PRED_{split}_" + names[i])
+                _plt.tight_layout()
+                w = len(str(self_inner.cfg.experiment.model.num_epochs))
+                outfile = os.path.join(outpath, f"{epoch:0{w}d}_{names[i]}.png")
+                _plt.savefig(outfile)
+                if self_inner.cfg.run_type.log_to_wandb and self_inner.local_rank == 0:
+                    _wandb.log({f"{epoch:0{w}d}: {split}_{names[i]}": _wandb.Image(fig)})
+                _plt.close(fig)
+
+        self.visualization = types.MethodType(_patched_visualization, self)
+
+        # ----- Patch train_one_epoch for freeze→unfreeze transition -----
+        _original_train_one_epoch = self.train_one_epoch.__func__
 
         def _patched_train_one_epoch(self_inner, epoch, iter_idx):
             if FREEZE_EPOCHS > 0 and epoch == FREEZE_EPOCHS:
                 self_inner.logger.info(
-                    f"Epoch {epoch}: unfreezing ViT attention blocks → "
-                    "rebuilding optimizer with Strategy B."
+                    f"Epoch {epoch}: unfreezing ViT attention → rebuilding optimiser (Strategy B)."
                 )
-                # Re-enable requires_grad on all parameters.
                 for param in self_inner.model.parameters():
                     param.requires_grad = True
                 patch_optimizer_strategy_b(self_inner)
-                # Recompile so the graph includes the newly-trainable parameters.
-                self_inner.model = torch.compile(self_inner.model, mode="default")
-
             return _original_train_one_epoch(self_inner, epoch, iter_idx)
 
         self.train_one_epoch = types.MethodType(_patched_train_one_epoch, self)
 
-        # Hook save_best_and_latest_checkpoint to compute train_iou.
-        # This is the only method called once per epoch that runs after COCO
-        # eval, making it a natural place to append the train IoU measurement.
-        # The result is stored in self._last_train_iou and picked up by the
-        # CSV writer below. Original checkpoint logic runs first, unchanged.
+        # ----- Hook save_best_and_latest_checkpoint to compute train_iou -----
         _original_save = self.save_best_and_latest_checkpoint.__func__
 
         def _patched_save(self_inner, epoch, val_loss_dict, val_metrics_dict):
@@ -424,29 +457,21 @@ def main(cfg):
                 self_inner._last_train_iou = float('nan')
                 return
 
-            self_inner.logger.info(
-                f"Epoch {epoch}: computing train_iou on "
-                f"{_n_iou}-image subset..."
-            )
-            predictor = Predictor(
-                self_inner.cfg,
-                local_rank=self_inner.local_rank,
-                world_size=self_inner.world_size,
-            )
+            self_inner.logger.info(f"Epoch {epoch}: computing train_iou on {_n_iou} images...")
+            predictor = Predictor(self_inner.cfg, local_rank=self_inner.local_rank,
+                                  world_size=self_inner.world_size)
             with torch.no_grad():
                 train_preds = predictor.predict_from_loader(
                     self_inner.model, self_inner.tokenizer, train_iou_loader
                 )
 
             if not train_preds:
-                self_inner.logger.info("train_iou: no polygons predicted → NaN")
+                self_inner.logger.info("train_iou: no polygons → NaN")
                 self_inner._last_train_iou = float('nan')
                 return
 
             _train_eval = Evaluator(self_inner.cfg)
-            _train_eval.load_gt(
-                self_inner.cfg.experiment.dataset.annotations["train"]
-            )
+            _train_eval.load_gt(self_inner.cfg.experiment.dataset.annotations["train"])
             _tmp = os.path.join(self_inner.cfg.output_dir, "_tmp_train_iou.json")
             with open(_tmp, "w") as fp:
                 json.dump(train_preds, fp)
@@ -455,53 +480,34 @@ def main(cfg):
             os.remove(_tmp)
 
             self_inner._last_train_iou = _train_metrics.get('IoU', float('nan'))
-            self_inner.logger.info(
-                f"train_iou (epoch {epoch}): {self_inner._last_train_iou:.4f}"
-            )
+            self_inner.logger.info(f"train_iou (epoch {epoch}): {self_inner._last_train_iou:.4f}")
 
-        self.save_best_and_latest_checkpoint = types.MethodType(
-            _patched_save, self
-        )
+        self.save_best_and_latest_checkpoint = types.MethodType(_patched_save, self)
 
-        # Inject the train_iou column into metrics.csv.
-        # train_val_loop writes the CSV in a local scope so there is no clean
-        # hook point for adding a column. The approach here is to swap out
-        # csv.writer at the module level with a thin wrapper that appends the
-        # extra value to every row. The header row gets a column name; data
-        # rows get the last computed self._last_train_iou value.
+        # ----- Inject train_iou column into metrics.csv via csv.writer wrapper -----
         import csv as _csv_module
-
         _OriginalWriter = _csv_module.writer
-
-        _trainer_ref = self  # capture for the closure
+        _trainer_ref = self
 
         class _PatchedWriter:
-            """csv.writer wrapper that appends the train_iou column to every row."""
             def __init__(self, f, *args, **kwargs):
                 self._w = _OriginalWriter(f, *args, **kwargs)
-
             def writerow(self, row):
                 row = list(row)
                 if row and row[0] == 'epoch':
-                    # header row — add column name
                     row.append('train_iou')
                 else:
-                    # data row — append current train_iou value
                     row.append(getattr(_trainer_ref, '_last_train_iou', float('nan')))
                 self._w.writerow(row)
-
             def __getattr__(self, name):
                 return getattr(self._w, name)
 
         _csv_module.writer = _PatchedWriter
-
-        self._last_train_iou = float('nan')  # initialise before loop starts
+        self._last_train_iou = float('nan')
 
         self.train_val_loop()
 
-        # Restore original csv.writer after training ends.
         _csv_module.writer = _OriginalWriter
-
         self.cleanup()
 
     trainer.train = types.MethodType(patched_train, trainer)

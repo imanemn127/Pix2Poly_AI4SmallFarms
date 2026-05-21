@@ -50,11 +50,12 @@ class ViT(nn.Module):
 
             # --- Discard pretrained pos_embed (we learn it from scratch) ---
             if 'pos_embed' in state_dict:
-                self.logger.info(
-                    "Discarding pretrained positional embeddings – "
-                    "learning them from scratch on the new image size."
-                )
                 state_dict.pop('pos_embed')
+
+            self.logger.info(
+                "Discarding pretrained patch_embed and pos_embed – "
+                "learning both from scratch on the new 32×32 image size."
+            )
 
             self.vit.load_state_dict(state_dict, strict=False)
 

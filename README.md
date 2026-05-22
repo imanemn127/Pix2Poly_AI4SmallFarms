@@ -251,6 +251,8 @@ Key parameters:
 | `backbone` | ViT-S/2 DINO | `patch_embed` and `pos_embed` reinitialised from scratch; attention weights loaded from DINO |
 | `augmentations` | D4 + Normalize | 8-fold dihedral group (rotations 0°/90°/180°/270° + reflections) |
 | `batch_size` | 4 | in `run_type/ai4smallfarms.yaml` |
+| `vertex_loss_weight` | 1.0 | weight of the coordinate cross-entropy loss |
+| `perm_loss_weight` | 3.0 | weight of the permutation matrix BCE loss; reduced from the P3 default of 10.0 because the perm matrix is much denser here (~126 active vertices vs ~10–50 in the original building dataset) |
 | `learning_rate` | decoder 1e-3, patch/pos embed 5e-4, attn 3e-5, other 3e-4 | per-group AdamW — see training strategy below |
 | `num_epochs` | 100 | |
 | `val_every` | 10 | IoU evaluated every 10 epochs |

@@ -21,7 +21,7 @@ fusion: patch_concat
 # optimization
 sinkhorn_iterations: 100
 vertex_loss_weight: 1.0
-perm_loss_weight: 10.0
+perm_loss_weight: 3.0  # reduced from 10.0 — dense perm matrix overwhelmed coord signal
 
 # training
 batch_size:   ${...run_type.batch_size}

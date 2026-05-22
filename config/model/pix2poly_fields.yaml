@@ -9,10 +9,10 @@ decoder:
 tokenizer:
   num_bins: 32
   shuffle_tokens: false
-  max_num_vertices: 384  
-  max_len: null          # computed at runtime: 384*2+2 = 770  
+  max_num_vertices: 192
+  max_len: null          # computed at runtime: 192*2+2 = 386
   pad_idx: null          # computed at runtime: 35 (32+BOS+EOS+PAD)
-  generation_steps: 770
+  generation_steps: 385
 
 shuffle_polygons: false
 

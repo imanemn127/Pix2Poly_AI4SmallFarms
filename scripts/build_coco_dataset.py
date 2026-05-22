@@ -302,7 +302,7 @@ def build_coco_json(all_image_records: list,
     """
     coco = {
         "info": {
-            "year": 2026,
+            "year": 2024,
             "version": "1.0",
             "description": "AI4SmallFarms Asia — COCO patches for Pix2Poly",
             "contributor": "",

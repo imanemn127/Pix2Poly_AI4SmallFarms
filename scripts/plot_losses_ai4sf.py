@@ -88,7 +88,7 @@ def main():
                  linestyle="--", label="Train IoU (subset)")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("IoU")
-    ax2.set_title("IoU (every 5 epochs)")
+    ax2.set_title("IoU (every 10 epochs)")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 

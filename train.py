@@ -10,7 +10,7 @@ import numpy as np
 # Configurable constants
 # --------------------------------------------------------------------
 FREEZE_EPOCHS = 10       # number of epochs with ViT attention frozen
-TRAIN_IOU_SUBSET = 128   # fixed subset size for train_iou estimate
+TRAIN_IOU_SUBSET = 512   # fixed subset size for train_iou estimate
 
 # --------------------------------------------------------------------
 # 1. Module / object replacements
@@ -204,7 +204,7 @@ def patch_optimizer_strategy_b(trainer):
     param_groups = [
         {"params": patch_embed_params, "lr": 5e-4, "name": "patch_embed"},
         {"params": pos_embed_params,   "lr": 5e-4, "name": "pos_embed"},
-        {"params": attn_params,        "lr": 1e-5, "name": "attn_blocks"},
+        {"params": attn_params,        "lr": 3e-5, "name": "attn_blocks"},
         {"params": decoder_params,     "lr": 1e-3, "name": "decoder"},
         {"params": other_params,       "lr": cfg.learning_rate, "name": "other"},
     ]
@@ -247,9 +247,11 @@ def main(cfg):
         patch_decoder(self.model)
 
         # ----- Phase-1 (frozen attention) or directly Strategy B -----
-        if FREEZE_EPOCHS > 0:
+        if FREEZE_EPOCHS > 0 and self.cfg.checkpoint is None:
             patch_optimizer_frozen(self)
         else:
+            for param in self.model.parameters():
+                param.requires_grad = True
             patch_optimizer_strategy_b(self)
 
         # ----- Build fixed train_iou loader (val transforms, no augmentation) -----
@@ -278,7 +280,11 @@ def main(cfg):
 
         _full_train_ds = _TrainDS(self.cfg, transform=_iou_transform, tokenizer=self.tokenizer)
         _n_iou = min(TRAIN_IOU_SUBSET, len(_full_train_ds))
-        _iou_subset = Subset(_full_train_ds, list(range(_n_iou)))
+        # ----- Select a fixed random subset (seed=0) so IoU is evaluated on the same images each epoch, spread across tiles -----
+
+        _rng = np.random.default_rng(seed=0)
+        _iou_indices = _rng.choice(len(_full_train_ds), size=_n_iou, replace=False).tolist()
+        _iou_subset = Subset(_full_train_ds, _iou_indices)
         _iou_subset.ann_file = _full_train_ds.ann_file
         _iou_subset.coco     = _full_train_ds.coco
         _iou_subset.split    = _full_train_ds.split
@@ -294,7 +300,7 @@ def main(cfg):
             shuffle=False,
         )
         self.logger.info(
-            f"train_iou_loader: {_n_iou} images (first {_n_iou} of train set, shuffle=False)"
+            f"train_iou_loader: {_n_iou} images (random subset seed=0, shuffle=False)"
         )
 
         # ----- Replace visualization: use raw COCO GT, skip non‑val epochs -----
@@ -436,7 +442,7 @@ def main(cfg):
         _original_train_one_epoch = self.train_one_epoch.__func__
 
         def _patched_train_one_epoch(self_inner, epoch, iter_idx):
-            if FREEZE_EPOCHS > 0 and epoch == FREEZE_EPOCHS:
+            if FREEZE_EPOCHS > 0 and epoch == FREEZE_EPOCHS and self_inner.cfg.checkpoint is None:
                 self_inner.logger.info(
                     f"Epoch {epoch}: unfreezing ViT attention → rebuilding optimiser (Strategy B)."
                 )

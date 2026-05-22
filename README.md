@@ -180,23 +180,30 @@ The 32×32 size was chosen to keep most patches well under the vertex budget.
 
 | max_num_vertices | Images > max (% of total) | Vertices lost (% of total) |
 |------------------|---------------------------|----------------------------|
-| 192 | 2446 (91.2 %) | 63.1 % |
-| 256 | 2199 (82.0 %) | 52.1 % |
-| **384** | **29 (1.1 %)** | **~0.5 %** |
-| 512 | 1084 (40.4 %) | 21.8 % |
-| 768 | 380 (14.2 %) | 8.4 % |
-| 1024 | 115 (4.3 %) | 4.6 % |
+| **192** | **1792 (15.5 %)** | **8.8 %** |
+| 256 | 524 (4.5 %) | 4.2 % |
+| 384 | 126 (1.1 %) | 2.0 % |
+| 512 | 75 (0.6 %) | 1.1 % |
+| 768 | 28 (0.2 %) | 0.3 % |
+| 1024 | 6 (0.1 %) | 0.1 % |
 
-With 384, over 98 % of patches are fully preserved. The resulting sequence length
-(`max_len = 384 × 2 + 2 = 770`) is also tractable for autoregressive generation.
+The current value is **192**, chosen after observing that the autoregressive decoder
+struggles with the longer sequences produced by 384: the model converges on loss but
+IoU stagnates, likely because the ratio of padding to real coordinate tokens is too
+high (~67 % of each sequence is PAD at 384, vs ~40 % at 192). Reducing to 192 halves
+the generation budget (`max_len = 192 × 2 + 2 = 386`, `generation_steps = 385`) and
+drops ~15.5 % of patches, which is an acceptable trade-off.
+
+The previous value was 384 (only 1.1 % patches dropped, but IoU did not improve past
+epoch 9 over 48 epochs of training). 192 is the current setting in
+`config/model/pix2poly_fields.yaml`.
 
 ### Filtering truncated patches
 
 Rather than letting the tokenizer silently truncate long sequences, patches whose total
 vertex count exceeds `max_num_vertices` are **removed at load time** by `p3_coco.py`.
-The `__init__` method filters `tile_ids` before any epoch starts, discarding ~1 % of
-patches (~112 images in the 32 px dataset). This keeps all remaining training examples
-exact — no polygon is ever partially predicted.
+The `__init__` method filters `tile_ids` before any epoch starts. This keeps all
+remaining training examples exact — no polygon is ever partially predicted.
 
 ### Check the dataset
 
@@ -237,13 +244,14 @@ Key parameters:
 | `patch_feature_size` | 16 | `in_size / patch_size` |
 | `num_patches` | 256 | `(32 / 2)²` |
 | `num_bins` | 32 | one bin per pixel column/row |
-| `max_num_vertices` | 384 | total vertices across all polygons in one patch; ~1.1 % of patches exceed this and are dropped at load time |
-| `max_len` | 770 | 384 × 2 coords + BOS + EOS, computed at runtime |
-| `generation_steps` | 770 | matches `max_len` |
+| `shuffle_tokens` | false | vertex order within a patch is fixed; shuffling was disabled to improve sequence learning stability |
+| `max_num_vertices` | 192 | total vertices across all polygons in one patch; ~15.5 % of patches exceed this and are dropped at load time |
+| `max_len` | 386 | 192 × 2 coords + BOS + EOS, computed at runtime |
+| `generation_steps` | 385 | matches `max_len` |
 | `backbone` | ViT-S/2 DINO | `patch_embed` and `pos_embed` reinitialised from scratch; attention weights loaded from DINO |
 | `augmentations` | D4 + Normalize | 8-fold dihedral group (rotations 0°/90°/180°/270° + reflections) |
 | `batch_size` | 4 | in `run_type/ai4smallfarms.yaml` |
-| `learning_rate` | decoder 1e-3, patch/pos embed 5e-4, other 3e-4 | per-group AdamW — see training strategy below |
+| `learning_rate` | decoder 1e-3, patch/pos embed 5e-4, attn 3e-5, other 3e-4 | per-group AdamW — see training strategy below |
 | `num_epochs` | 100 | |
 | `val_every` | 10 | IoU evaluated every 10 epochs |
 
@@ -297,7 +305,7 @@ touching anything on disk.
 | 5. Decoder regularisation | model object, applied after `setup_model()` | `patch_decoder(model)` increases dropout from 0.1 → 0.2 in every `TransformerDecoderLayer` (self-attn, cross-attn, FFN). |
 | 6. Training strategy | optimizer + scheduler, applied after `setup_optimizer()` | Two-phase fine-tuning: phase 1 (`patch_optimizer_frozen`) freezes ViT attention blocks for `FREEZE_EPOCHS` epochs while training everything else; phase 2 (`patch_optimizer_strategy_b`) unfreezes attention with a low LR (1e-5) and restarts the scheduler from warmup. See training strategy below. |
 | 7. Visualization | `trainer.visualization`, replaced entirely | The original `visualization()` is replaced with a version that (a) skips non-validation epochs to avoid running the full autoregressive decoder every epoch, and (b) draws GT polygons from raw `coco.imgToAnns` pixel-space coordinates instead of decoded tokens. Token-decoded coordinates live in `[0, num_bins-1]` (0–31 for 32×32 patches) and match the image, but reconstruction through the tokenizer loses precision; raw COCO annotations are exact. |
-| 8. Train IoU logging | CSV writer (`csv.writer` swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 128-image train subset (shuffle=False); the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
+| 8. Train IoU logging | CSV writer (`csv.writer` swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 512-image train subset selected randomly (seed=0, shuffle=False) spread across all tiles; the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
 
 Nothing in the installed package is touched on disk.
 
@@ -353,7 +361,7 @@ very low LR. The model is **not** recompiled: `torch.compile` was applied once i
 |-----------------|--------------|
 | `patch_embed` | 5e-4 |
 | `pos_embed` | 5e-4 |
-| Attention blocks | 1e-5 |
+| Attention blocks | 3e-5 |
 | Decoder | 1e-3 |
 | Everything else | `cfg.learning_rate` |
 
@@ -392,8 +400,9 @@ tail -f train_ai4smallfarms.log
 Each epoch appends a row to `metrics.csv`: `epoch`, `train_loss`, `val_loss`,
 `val_iou`, `train_iou`. Both IoU columns are computed every `val_every` epochs
 (default: 10); other epochs write `nan`. `val_iou` is used for best-checkpoint
-selection. `train_iou` is estimated on a fixed 128-image subset of the training set
-(shuffle=False) so the same patches are used every evaluation.
+selection. `train_iou` is estimated on a fixed 512-image random subset (seed=0,
+shuffle=False) spread across all tiles, so the same patches are used every evaluation
+epoch.
 
 ```bash
 # Auto-detect the latest run:

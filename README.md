@@ -20,11 +20,13 @@ Sentinel-2 is 10 m/pixel, 3-band uint16. That gap creates several concrete probl
 
 | Problem | What breaks | Fix |
 |---------|------------|-----|
-| Much larger fields at 10 m/px | Patches with hundreds of vertices exceed `max_num_vertices` | Reduced patch size to 32×32; set `max_num_vertices` to 384 (only 1.1 % of patches exceed this) |
-| uint16 reflectance values | Default normalisation assumes uint8 | Custom `denormalize_s2` patched at runtime |
+| Much larger fields at 10 m/px | Patches with hundreds of vertices exceed `max_num_vertices` | Reduced patch size to 32×32; set `max_num_vertices` to 192 |
+| uint16 reflectance values | Default normalisation assumes uint8 | Custom `denormalize_s2` patched at runtime; real per-channel stats computed on training set |
 | ViT expects 224×224 input | Shape mismatch when loading pretrained weights | Both `patch_embed` and `pos_embed` discarded; relearned from scratch on 32×32 |
 | NumPy ≥ 2.0 in base env | `torch.from_numpy()` raises `RuntimeError` | Dedicated `ai4sf` conda env pinned to NumPy 1.26.4 |
 | Evaluator hard-codes category 100 (building) | IoU evaluated against wrong category | Evaluator and predictor patched to use category id=1 (field) |
+| `calc_IoU` returns 1.0 for void images | Fake IoU floor (~0.051) masks real model performance | Patched to return `nan`; void images excluded from the mean |
+| Decoder mode collapse | Coordinate tokens stuck at constant bin (0 or 31) for all inputs | Decoder LR reduced from 1e-3 to 3e-4; `vertex_loss_weight` raised to force coordinate learning |
 
 The approach is to patch the installed package **at runtime** rather than modifying it on
 disk, keeping the fork clean and making the patches explicit and auditable.
@@ -50,11 +52,13 @@ Pix2Poly_AI4SmallFarms/
 │   ├── run_type/ai4smallfarms.yaml
 │   └── training/default.yaml
 └── scripts/
-    ├── build_coco_dataset.py   # tile → COCO patches
-    ├── inspect_coco.py         # sanity-check visualisation
-    ├── coco_to_gpkg.py         # export annotations to GeoPackage
-    ├── stats.py                # dataset statistics
-    └── plot_losses_ai4sf.py    # plot metrics.csv curves
+    ├── build_coco_dataset.py     # tile → COCO patches (clips annotations to patch boundary)
+    ├── inspect_coco.py           # sanity-check visualisation
+    ├── coco_to_gpkg.py           # export annotations to GeoPackage
+    ├── stats.py                  # dataset statistics
+    ├── compute_normalization.py  # compute per-channel mean/std on training patches
+    ├── diag_eos.py               # diagnostic: EOS position analysis + perm_matrix/coord inspection
+    └── plot_losses_ai4sf.py      # plot metrics.csv curves
 ```
 
 ---
@@ -155,6 +159,12 @@ plus the actual patch images under `<split>/patches_32/`.
 The patch images are saved as 3-band GeoTIFFs, reading bands `[4, 3, 2]` (Red, Green,
 Blue) from the original 10-band Sentinel-2 tiles.
 
+**GT polygon border clipping.** Reference field polygons sometimes extend slightly
+outside the 32×32 patch boundary (fields that straddle tile edges). `build_coco_dataset.py`
+clips every polygon to the patch extent before writing pixel coordinates. Without this,
+visualisations show annotation vertices outside the image, and the model receives
+out-of-range coordinate targets.
+
 ### Too many polygon vertices per patch
 
 **Problem.** A 224×224 px patch at 10 m resolution covers 2.24 km × 2.24 km and can
@@ -162,10 +172,8 @@ contain several hundred fields. The original P3 model was designed for 1–10 bu
 per image (`max_num_vertices = 192`). With hundreds of fields, a single patch can have
 thousands of vertices, far exceeding that limit.
 
-**Solution: reduce patch size and raise `max_num_vertices`.** I progressively reduced
-the patch size and simultaneously increased the model's vertex capacity.
-
-All values below were measured on the actual dataset using `scripts/stats.py`.
+**Solution: reduce patch size.** I progressively reduced the patch size and measured
+vertex counts at each size using `scripts/stats.py`.
 
 | Patch size | Ground area | Avg fields/patch | Avg total vertices |
 |------------|-------------|------------------|--------------------|
@@ -187,16 +195,16 @@ The 32×32 size was chosen to keep most patches well under the vertex budget.
 | 768 | 28 (0.2 %) | 0.3 % |
 | 1024 | 6 (0.1 %) | 0.1 % |
 
-The current value is **192**, chosen after observing that the autoregressive decoder
-struggles with the longer sequences produced by 384: the model converges on loss but
-IoU stagnates, likely because the ratio of padding to real coordinate tokens is too
-high (~67 % of each sequence is PAD at 384, vs ~40 % at 192). Reducing to 192 halves
-the generation budget (`max_len = 192 × 2 + 2 = 386`, `generation_steps = 385`) and
-drops ~15.5 % of patches, which is an acceptable trade-off.
+The current value is **192** (`max_len = 192 × 2 + 2 = 386`, `generation_steps = 385`),
+dropping ~15.5 % of patches.
 
-The previous value was 384 (only 1.1 % patches dropped, but IoU did not improve past
-epoch 9 over 48 epochs of training). 192 is the current setting in
-`config/model/pix2poly_fields.yaml`.
+**Training history with `max_num_vertices`:**
+- First run used **384** (1.1 % patches dropped). After 48 epochs IoU never exceeded 0.051.
+  Hypothesis: too many vertices per sequence was harming decoder learning.
+- Reduced to **192**. After 30 more epochs IoU was still exactly 0.051 every eval epoch.
+  This looked like stagnation but was in fact the `calc_IoU` void-image bug (patch 3c):
+  127 of 2477 val images have no annotation; on those, union=0 → `calc_IoU` returned 1.0,
+  creating a persistent floor of 127/2477 ≈ 0.051 regardless of what the model predicted.
 
 ### Filtering truncated patches
 
@@ -240,26 +248,47 @@ Key parameters:
 | Parameter | Value | Note |
 |-----------|-------|------|
 | `in_size` | 32 px | 320 m × 320 m at 10 m/px |
-| `patch_size` | 2 | Finer ViT tokenisation on 32×32 input |
-| `patch_feature_size` | 16 | `in_size / patch_size` |
-| `num_patches` | 256 | `(32 / 2)²` |
+| `patch_size` | 4 | 4×4 px ViT tokens (40 m × 40 m); was 2, reduced token count from 256 to 64 |
+| `patch_feature_size` | 8 | `in_size / patch_size` |
+| `num_patches` | 64 | `(32 / 4)²` |
 | `num_bins` | 32 | one bin per pixel column/row |
-| `shuffle_tokens` | false | vertex order within a patch is fixed; shuffling was disabled to improve sequence learning stability |
-| `max_num_vertices` | 192 | total vertices across all polygons in one patch; ~15.5 % of patches exceed this and are dropped at load time |
+| `shuffle_tokens` | false | vertex order fixed; shuffling disabled for sequence stability |
+| `max_num_vertices` | 192 | total vertices across all polygons in one patch; ~15.5 % of patches dropped at load time |
 | `max_len` | 386 | 192 × 2 coords + BOS + EOS, computed at runtime |
 | `generation_steps` | 385 | matches `max_len` |
 | `backbone` | ViT-S/2 DINO | `patch_embed` and `pos_embed` reinitialised from scratch; attention weights loaded from DINO |
-| `augmentations` | D4 + Normalize | 8-fold dihedral group (rotations 0°/90°/180°/270° + reflections) |
+| `image_mean` | [0.2416, 0.1120, 0.1008] | per-channel mean after dividing by 10000, computed on 11579 train patches |
+| `image_std` | [0.0694, 0.0510, 0.0324] | per-channel std, same computation |
+| `image_max_pixel_value` | 10000.0 | S2 reflectance scale factor |
+| `augmentations` | D4 + Normalize | 8-fold dihedral group + channel normalisation |
 | `batch_size` | 4 | in `run_type/ai4smallfarms.yaml` |
-| `vertex_loss_weight` | 1.0 | weight of the coordinate cross-entropy loss |
-| `perm_loss_weight` | 3.0 | weight of the permutation matrix BCE loss; reduced from the P3 default of 10.0 because the perm matrix is much denser here (~126 active vertices vs ~10–50 in the original building dataset) |
-| `learning_rate` | decoder 1e-3, patch/pos embed 5e-4, attn 3e-5, other 3e-4 | per-group AdamW — see training strategy below |
+| `vertex_loss_weight` | 10.0 | coordinate cross-entropy weight; raised from 1.0 to fix decoder mode collapse |
+| `perm_loss_weight` | 3.0 | permutation matrix BCE weight; reduced from P3 default of 10.0 |
+| `learning_rate` | decoder 3e-4, patch/pos embed 5e-4, attn 3e-5, other 3e-4 | per-group AdamW |
 | `num_epochs` | 100 | |
 | `val_every` | 10 | IoU evaluated every 10 epochs |
 
-The Sentinel-2 normalisation is currently set to identity (mean=0, std=1,
-max_pixel=10000) in `config/encoder/vit_s2.yaml`. Update with per-dataset per-channel
-statistics for better convergence once you have them.
+### Sentinel-2 normalisation
+
+S2 reflectance values are stored as uint16 scaled by 10000. The ViT backbone expects
+inputs centred near zero. Earlier runs used identity normalisation (mean=0, std=1),
+which fed values in [0, 0.4] to a backbone expecting [-2, 2] inputs.
+
+The normalisation stats were computed on all 11579 training patches using the Welford
+online algorithm (`scripts/compute_normalization.py`):
+
+```
+image_mean: [0.2416, 0.1120, 0.1008]   # bands R, G, B after /10000
+image_std:  [0.0694, 0.0510, 0.0324]
+```
+
+To recompute for a different dataset:
+
+```bash
+python scripts/compute_normalization.py
+# or on a random subset for speed:
+python scripts/compute_normalization.py --max_images 2000
+```
 
 ---
 
@@ -270,7 +299,7 @@ tmux new -s ai4sf
 conda activate ai4sf
 cd /path/to/Pix2Poly_AI4SmallFarms
 
-CUDA_VISIBLE_DEVICES=0 python train.py experiment=p2p_ai4smallfarms 
+CUDA_VISIBLE_DEVICES=0 python train.py experiment=p2p_ai4smallfarms
 ```
 
 Or:
@@ -285,8 +314,10 @@ Checkpoints and `metrics.csv` go to a timestamped directory under `out_path`:
 ```
 <out_path>/pix2poly/32/v1_image_vit_bs4_ai4smallfarms/<YYYY-MM-DD_HH-MM-SS>/
 ├── checkpoints/
-│   ├── best.pth
-│   └── latest.pth
+│   ├── best_val_loss.pth
+│   ├── best_val_iou.pth
+│   ├── latest.pth
+│   └── epoch_N.pth
 └── metrics.csv
 ```
 
@@ -299,94 +330,85 @@ touching anything on disk.
 
 | Patch | Affected module(s) | What it changes |
 |-------|-------------------|-----------------|
-| 1. Dataset | `pixelspointspolygons.datasets.p3_coco` | Replaces `P3Dataset` / `TrainDataset` / `ValDataset` / `TestDataset` with the local `p3_coco.py` versions, which use `_safe_to_tensor()`, drop all LiDAR code, and filter out patches exceeding `max_num_vertices` at load time. |
-| 2. ViT backbone | `pixelspointspolygons.models.vision_transformer` and `…model_pix2poly` | Replaces the original `ViT` class with `modified_vit.ViT`, which builds the model at `img_size=32, patch_size=2`, and discards the pretrained `pos_embed` and `patch_embed` weights so they are learned from scratch (attention weights are kept). |
-| 3a. Evaluator category | `pixelspointspolygons.eval.evaluator` | Overrides `compute_coco_metrics` to use `catIds=[1]` (field) instead of the hard-coded `[100]` (building). |
+| 1. Dataset | `pixelspointspolygons.datasets.p3_coco` | Replaces dataset classes with local `p3_coco.py` versions: safe tensor conversion, no LiDAR, filters patches exceeding `max_num_vertices` at load time. |
+| 2. ViT backbone | `pixelspointspolygons.models.vision_transformer` and `…model_pix2poly` | Replaces `ViT` with `modified_vit.ViT`: builds at `img_size=32, patch_size=4`, discards pretrained `pos_embed` and `patch_embed`, keeps attention weights. |
+| 3a. Evaluator category | `pixelspointspolygons.eval.evaluator` | Overrides `compute_coco_metrics` to use `catIds=[1]` (field) instead of hard-coded `[100]` (building). |
 | 3b. Prediction category | `pixelspointspolygons.misc.coco_conversions` and `…predictor_pix2poly` | Wraps `generate_coco_ann` to write `category_id=1` into every predicted annotation. |
-| 4. Visualisation | `pixelspointspolygons.misc.shared_utils` and `…trainer_pix2poly` | Replaces `denormalize_image_for_visualization` with `denormalize_s2`, which inverts the Normalize transform then applies a per-channel p2–p98 percentile stretch. Linear rescaling by `max_pixel_value=10000` produces near-black images because S2 reflectance clusters in the bottom 20–30 % of the range; the percentile stretch makes training visualisations readable. |
-| 5. Decoder regularisation | model object, applied after `setup_model()` | `patch_decoder(model)` increases dropout from 0.1 → 0.2 in every `TransformerDecoderLayer` (self-attn, cross-attn, FFN). |
-| 6. Training strategy | optimizer + scheduler, applied after `setup_optimizer()` | Two-phase fine-tuning: phase 1 (`patch_optimizer_frozen`) freezes ViT attention blocks for `FREEZE_EPOCHS` epochs while training everything else; phase 2 (`patch_optimizer_strategy_b`) unfreezes attention with a low LR (1e-5) and restarts the scheduler from warmup. See training strategy below. |
-| 7. Visualization | `trainer.visualization`, replaced entirely | The original `visualization()` is replaced with a version that (a) skips non-validation epochs to avoid running the full autoregressive decoder every epoch, and (b) draws GT polygons from raw `coco.imgToAnns` pixel-space coordinates instead of decoded tokens. Token-decoded coordinates live in `[0, num_bins-1]` (0–31 for 32×32 patches) and match the image, but reconstruction through the tokenizer loses precision; raw COCO annotations are exact. |
-| 8. Train IoU logging | CSV writer (`csv.writer` swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 512-image train subset selected randomly (seed=0, shuffle=False) spread across all tiles; the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
+| 3c. IoU metric fix | `pixelspointspolygons.eval.cIoU` | `calc_IoU` returned 1.0 when both GT and prediction are empty (union=0), creating a fake floor of ~0.051 (5.1 % of val images have no annotation). Now returns `nan`; void images excluded from the mean. |
+| 4. Visualisation | `pixelspointspolygons.misc.shared_utils` and `…trainer_pix2poly` | Replaces `denormalize_image_for_visualization` with `denormalize_s2`: inverts Normalize, then applies per-channel p2–p98 percentile stretch. Needed because S2 reflectance clusters in the bottom 20–30 % of the range; linear rescaling produces near-black images. |
+| 5. Decoder regularisation | model object | `patch_decoder(model)` increases dropout from 0.1 → 0.2 in every `TransformerDecoderLayer`. |
+| 6. Training strategy | optimizer + scheduler | Two-phase: phase 1 freezes ViT attention for `FREEZE_EPOCHS` epochs; phase 2 unfreezes with low LR and restarts warmup. |
+| 7. Visualization gating | `trainer.visualization` | Skips visualization on non-val epochs; draws GT from raw COCO pixel coordinates instead of decoded tokens. |
+| 8. Train IoU logging | CSV writer (swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 512-image train subset selected randomly (seed=0, shuffle=False) spread across all tiles; the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
+| 9. Loss breakdown logging | `train_one_epoch` hook + CSV writer | Captures `coords_loss` and `perm_loss` each epoch and writes them as extra CSV columns, enabling diagnosis of coordinate vs permutation learning. |
 
 Nothing in the installed package is touched on disk.
 
 ### Adapting the ViT backbone for 32×32 input
 
-The DINO checkpoint was trained at 224×224 with patch size 8, giving a 28×28 grid (785
-position embeddings including the CLS token, shape `(1, 785, 384)`). The training
-patches are 32×32 with patch size 2, which yields a 16×16 grid (257 position
-embeddings). The shapes are incompatible, and the patch projection kernel changes from
-8×8 to 2×2.
+The DINO checkpoint was trained at 224×224 with patch size 8, giving a 28×28 grid.
+The training patches are 32×32 with patch size 4, giving an 8×8 grid (65 position
+embeddings). Shapes are incompatible.
 
 **Approach: discard incompatible weights, keep attention.** `modified_vit.py` builds
-the ViT with `img_size=32, patch_size=2, pretrained=False`, loads the DINO checkpoint,
-removes both `pos_embed` and `patch_embed` keys, and calls `load_state_dict(...,
-strict=False)`.
+the ViT with `img_size=32, patch_size=4, pretrained=False`, loads the DINO checkpoint,
+removes `pos_embed` and `patch_embed` keys, and calls `load_state_dict(..., strict=False)`.
 
 | Component | Initialisation |
 |-----------|---------------|
-| `patch_embed` (2×2 conv) | Random — kernel shape changed from 8×8, incompatible |
-| `pos_embed` (257 positions) | Random — grid changed from 28×28 to 16×16 |
-| Attention weights | Loaded from DINO — frozen during phase 1, fine-tuned at 1e-5 in phase 2 |
+| `patch_embed` (4×4 conv) | Random — kernel changed from 8×8 |
+| `pos_embed` (65 positions) | Random — grid changed from 28×28 to 8×8 |
+| Attention weights | Loaded from DINO — frozen phase 1, fine-tuned at 3e-5 phase 2 |
 | MLP layers, layer norms | Loaded from DINO — trained from epoch 0 |
-| Decoder (transformer + prediction heads) | Random — freshly initialised, not part of the DINO checkpoint |
+| Decoder | Random — not part of DINO checkpoint |
 
 ### Training strategy
 
-The current approach is a two-phase schedule controlled by `FREEZE_EPOCHS` in `train.py`.
+Two-phase schedule controlled by `FREEZE_EPOCHS` in `train.py`.
 
-**Phase 1 — freeze attention, train patch embed + decoder** (`patch_optimizer_frozen`)
-
-For the first `FREEZE_EPOCHS` epochs only the `.attn.` parameters inside
-`encoder.vit.blocks` are frozen (Q, K, V and output projection). MLP layers, layer
-norms, `patch_embed`, `pos_embed` and the decoder are trained from the start.
+**Phase 1 — freeze attention** (`patch_optimizer_frozen`)
 
 | Parameter group | Learning rate |
 |-----------------|--------------|
 | `patch_embed` | 5e-4 |
 | `pos_embed` | 5e-4 |
-| Decoder | 1e-3 |
-| Everything else (MLP, norms, …) | `cfg.learning_rate` |
+| Decoder | 3e-4 |
+| Everything else | 3e-4 |
 
-Rationale: DINO attention features are pretrained on ImageNet 224×224 RGB; freezing them for the first few epochs lets the randomly initialised patch embedding, positional embedding, and decoder warm up before the encoder attention weights are exposed to gradient updates.
-
-**Phase 2 — train everything with separate LRs** (`patch_optimizer_strategy_b`)
-
-At epoch `FREEZE_EPOCHS` the attention blocks are unfrozen, `requires_grad` is
-re-enabled on all parameters, and the optimizer is rebuilt with an extra group at a
-very low LR. The model is **not** recompiled: `torch.compile` was applied once in
-`train_val_loop`, and TorchDynamo recompiles automatically on the next forward when
-`requires_grad` changes.
+**Phase 2 — train everything** (`patch_optimizer_strategy_b`)
 
 | Parameter group | Learning rate |
 |-----------------|--------------|
 | `patch_embed` | 5e-4 |
 | `pos_embed` | 5e-4 |
 | Attention blocks | 3e-5 |
-| Decoder | 1e-3 |
-| Everything else | `cfg.learning_rate` |
+| Decoder | 3e-4 |
+| Everything else | 3e-4 |
 
-The scheduler is also rebuilt at this point and restarts from warmup. The warmup
-lasts ~5 % of total steps, so the LR spike at the transition is brief and negligible
-on a 100-epoch run.
+Set `FREEZE_EPOCHS = 0` to skip phase 1.
 
-Set `FREEZE_EPOCHS = 0` to skip phase 1 and start directly with Strategy B.
+#### Why these learning rates and loss weights
 
-The warmup–linear-decay scheduler uses a 5 % warmup in both phases.
+Diagnostic analysis (using `coords_loss` and `perm_loss` from the CSV) showed the
+decoder producing the same coordinate token for every input position after 30 epochs
+— a classic mode collapse. `coords_loss` was flat at ~3.40, close to the random
+baseline `log(35) ≈ 3.56`, while `perm_loss` continued falling. Two root causes:
+
+- **Decoder LR too high (1e-3)**: the decoder converged to the lowest-loss constant
+  before the encoder features stabilised. Reduced to 3e-4.
+- **`vertex_loss_weight` too low (1.0)**: with perm_loss at ~0.05 and coords_loss at
+  ~3.4, the coordinate gradient was overwhelmed. Raised to 10.0.
 
 ### Training optimisations
 
-Because this project uses the
-[Pix2poly_P3_image_only](https://github.com/imanemn127/Pix2poly_P3_image_only)
-fork as its backend, all the optimisations from there are inherited automatically:
+All inherited from the
+[Pix2poly_P3_image_only](https://github.com/imanemn127/Pix2poly_P3_image_only) fork:
 
 | Optimisation | Effect |
 |---|---|
 | Mixed precision (AMP) | ~2× memory reduction, faster forward/backward |
 | `torch.compile` | Faster iterations after the first step |
 | Gradient clipping (norm 1.0) | Prevents divergence with long vertex sequences |
-| Separate visualisation loader | Clean, augmentation-free validation previews |
 | BCELoss NaN fix | Clamps logits to avoid `log(0)` |
 | Memory cleanup per epoch | `empty_cache()` + `gc.collect()` |
 
@@ -399,76 +421,69 @@ watch -n 1 nvidia-smi
 tail -f train_ai4smallfarms.log
 ```
 
-Each epoch appends a row to `metrics.csv`: `epoch`, `train_loss`, `val_loss`,
-`val_iou`, `train_iou`. Both IoU columns are computed every `val_every` epochs
-(default: 10); other epochs write `nan`. `val_iou` is used for best-checkpoint
-selection. `train_iou` is estimated on a fixed 512-image random subset (seed=0,
-shuffle=False) spread across all tiles, so the same patches are used every evaluation
-epoch.
+Each epoch appends a row to `metrics.csv`:
+
+| Column | Description |
+|--------|-------------|
+| `epoch` | Epoch index |
+| `train_loss` | Total training loss |
+| `val_loss` | Total validation loss |
+| `val_iou` | Mask IoU on full val set (every `val_every` epochs, else `nan`); void images excluded |
+| `train_iou` | Mask IoU on fixed 512-image train subset (every `val_every` epochs, else `nan`) |
+| `coords_loss` | Coordinate cross-entropy × `vertex_loss_weight` |
+| `perm_loss` | Permutation matrix BCE × `perm_loss_weight` |
+
+A healthy run shows `coords_loss` decreasing from its epoch-0 value within the first
+10 epochs. If it stays flat while `perm_loss` falls, the decoder is not learning
+coordinates — check decoder LR and `vertex_loss_weight`.
 
 ```bash
-# Auto-detect the latest run:
-python scripts/plot_losses_ai4sf.py
-
-# Point at a specific run folder:
-python scripts/plot_losses_ai4sf.py /path/to/run/2026-05-07_12-41-40
+python scripts/plot_losses_ai4sf.py                        # auto-detect latest run
+python scripts/plot_losses_ai4sf.py /path/to/run/folder   # specific run
 ```
-
-Saves `loss_curves_ai4sf.png` alongside `metrics.csv`.
 
 ---
 
 ## Troubleshooting
 
 **`RuntimeError: can't convert np.ndarray to tensor`**  
-NumPy ≥ 2.0 is installed. Fix: `pip install "numpy==1.26.4"`. This must be pinned
-*before* installing any package that could pull in a newer NumPy.
+NumPy ≥ 2.0 is installed. Fix: `pip install "numpy==1.26.4"`.
 
 **`FileNotFoundError` for checkpoint or dataset**  
-The placeholder paths in the config files haven't been set yet. Check
-`config/encoder/vit_s2.yaml` and `config/dataset/ai4smallfarms.yaml`.
+Placeholder paths not set. Check `config/encoder/vit_s2.yaml` and `config/dataset/ai4smallfarms.yaml`.
 
 **`ImportError: open3d` or any LiDAR-related error**  
-You installed the original P3 repo instead of the fork. Reinstall from
-`https://github.com/imanemn127/Pix2poly_P3_image_only`.
+Wrong P3 repo installed. Reinstall from `https://github.com/imanemn127/Pix2poly_P3_image_only`.
 
 **ViT shape mismatch at startup**  
-The ViT patch in `train.py` wasn't applied. Always launch with
-`python train.py`, not by importing the trainer directly. The patching relies on
-Python's module reference system — it only takes effect if `train.py` is the entry
-point.
+Always launch with `python train.py`, not by importing the trainer directly.
 
 **`CUDA out of memory`**  
-Lower `batch_size` in `config/run_type/ai4smallfarms.yaml`. The default is 4; reducing
-to 2 or 1 may be necessary on GPUs with less than 24 GB.
+Lower `batch_size` in `config/run_type/ai4smallfarms.yaml`.
 
-**`ModuleNotFoundError: sklearn`**  
-`p3_coco.py` imports `sklearn.preprocessing.MinMaxScaler` (used in the stubbed-out
-LiDAR path, which never executes during training). Fix: `pip install scikit-learn`.
+**Checkpoint resume fails with `unexpected key "_orig_mod.*"`**  
+`torch.compile` wraps the model and prefixes all parameter keys with `_orig_mod.`.
+If you save with a compiled model and load into an uncompiled one (or vice versa),
+`load_state_dict` will complain. Fix: strip or add the prefix when loading, or always
+compile before loading.
 
-**IoU is always 0 or evaluation crashes**  
-The evaluator category patch wasn't applied. Make sure you are launching with
-`python train.py` (not importing the trainer directly) and that patch 3a/3b in
-`train.py` is present.
+**`val_iou` is always NaN**  
+`coords_loss` must drop below its epoch-0 value (~3.5 × `vertex_loss_weight`) before
+meaningful predictions appear.
 
-**`val_iou` is always NaN / "No polygons predicted"**  
-The model has not converged yet — train loss must fall well below `log(vocab_size) ≈
-3.56` before EOS tokens appear in predictions. Convergence is slow in the first
-`FREEZE_EPOCHS` epochs while attention is frozen; IoU typically starts appearing
-after the phase-2 transition.
+**`val_iou` is suspiciously stable (e.g. always ~0.051)**  
+This is the void-image artifact from the original `calc_IoU` bug. Ensure patch 3c is
+present in `train.py`.
 
 **Training visualisations are very dark / near-black**  
-`denormalize_s2` is not being applied. Confirm that the `shared_utils` and
-`trainer_pix2poly` patches (patch 4 in the table above) are present in `train.py` and
-that `train.py` is the entry point. The function uses per-channel p2–p98 percentile
-stretch to handle the narrow S2 reflectance distribution.
+`denormalize_s2` is not being applied. Confirm patch 4 is present and `train.py` is
+the entry point.
 
 **tmux session dies silently**  
 Use the full Python path: `/path/to/envs/ai4sf/bin/python train.py`.
 
 **`build_coco_dataset.py` finds no tiles**  
-The script expects `train/images/`, `validate/images/`, and `test/images/` under
-`--data_root`. Note the raw AI4SmallFarms download uses `validate/`, not `val/`.
+The raw AI4SmallFarms download uses `validate/`, not `val/`.
 
 ---
 

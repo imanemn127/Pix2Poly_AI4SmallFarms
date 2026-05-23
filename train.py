@@ -189,7 +189,7 @@ def patch_decoder(model):
         layer.multihead_attn.dropout = 0.2
 
 # --------------------------------------------------------------------
-# 6. Optimiser & scheduler utilities
+# 6. Optimiser & scheduler utilities 
 # --------------------------------------------------------------------
 def _rebuild_scheduler(trainer):
     """Replace the current scheduler with a fresh one tied to trainer.optimizer."""

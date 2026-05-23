@@ -13,18 +13,19 @@ in_height: ${.in_size}
 in_width:  ${.in_size}
 
 # patching
-patch_size: 2
-patch_feature_size: 16          # 32 / 2
+patch_size: 4                   # was 2 — 4×4 px tokens (40m×40m) give 64 tokens vs 256, easier cross-attention
+patch_feature_size: 8           # was 16 — 32 / 4
 patch_feature_height: ${.patch_feature_size}
 patch_feature_width:  ${.patch_feature_size}
 patch_feature_dim: 384
-num_patches: 256                 # (32 / 2)^2
+num_patches: 64                  # was 256 — (32 / 4)^2
 
 out_feature_dim: ${..model.decoder.in_feature_dim}
 
 # Sentinel-2 uint16: reflectance scaled ×10000
-image_mean: [0.0, 0.0, 0.0]
-image_std:  [1.0, 1.0, 1.0]
+# Stats computed on 11579 train patches (bands 1,2,3) — was [0,0,0]/[1,1,1]
+image_mean: [0.2416, 0.1120, 0.1008]
+image_std:  [0.0694, 0.0510, 0.0324]
 image_max_pixel_value: 10000.0
 
 augmentations:

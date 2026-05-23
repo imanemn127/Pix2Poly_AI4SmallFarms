@@ -75,6 +75,71 @@ coco_conv_module.generate_coco_ann = patched_generate_coco_ann
 import pixelspointspolygons.predict.predictor_pix2poly as pred_module
 pred_module.generate_coco_ann = patched_generate_coco_ann
 
+# Patch calc_IoU: void images (no GT and no prediction) are excluded from
+# the average instead of being counted as perfect IoU=1.0.
+import pixelspointspolygons.eval.cIoU as ciou_module
+
+def patched_calc_IoU(a, b):
+    import numpy as np
+    I = np.sum(np.logical_and(a, b))
+    U = np.sum(np.logical_or(a, b))
+    if U == 0:
+        return float('nan')   # excluded from mean below
+    return float(I) / float(U)
+
+ciou_module.calc_IoU = patched_calc_IoU
+
+# Patch compute_IoU_cIoU to use nanmean so NaN void images are skipped.
+_orig_compute_IoU_cIoU = ciou_module.compute_IoU_cIoU
+
+def patched_compute_IoU_cIoU(input_json, gti_annotations, subset=False, pbar_disable=False):
+    import numpy as np
+    from pycocotools.coco import COCO
+    import json
+    from tqdm import tqdm
+    from pixelspointspolygons.eval.utils import get_pixel_mask_from_coco_seg
+
+    coco_gt = COCO(gti_annotations)
+    with open(input_json) as f:
+        data = json.load(f)
+    coco_dt = coco_gt.loadRes(data) if data else coco_gt
+
+    if subset:
+        image_ids = coco_dt.getImgIds(catIds=coco_dt.getCatIds())
+    else:
+        image_ids = coco_gt.getImgIds()
+
+    bar = tqdm(image_ids, disable=pbar_disable)
+    list_iou, list_ciou, list_nr = [], [], []
+    for image_id in bar:
+        mask_gt, N_GT = get_pixel_mask_from_coco_seg(coco_gt, image_id, return_n_verts=True)
+        mask_dt, N_DT = get_pixel_mask_from_coco_seg(coco_dt, image_id, return_n_verts=True)
+        nr  = 1 - np.abs(N_DT - N_GT) / (N_DT + N_GT + 1e-9)
+        iou = ciou_module.calc_IoU(mask_dt, mask_gt)
+        if not np.isnan(iou):           # skip void images
+            list_iou.append(iou)
+            list_ciou.append(iou * nr)
+            list_nr.append(nr)
+        bar.set_description("IoU: %2.4f, C-IoU: %2.4f, NR: %2.4f" % (
+            np.nanmean(list_iou) if list_iou else 0.0,
+            np.nanmean(list_ciou) if list_ciou else 0.0,
+            np.nanmean(list_nr) if list_nr else 0.0,
+        ))
+        bar.refresh()
+
+    iou   = float(np.mean(list_iou))   if list_iou  else 0.0
+    ciou  = float(np.mean(list_ciou))  if list_ciou else 0.0
+    nr    = float(np.mean(list_nr))    if list_nr   else 0.0
+
+    if subset:
+        print("sIoU: %2.4f, sC-IoU: %2.4f, sNR: %2.4f" % (iou, ciou, nr))
+        return {"sIoU": iou, "sC-IoU": ciou, "sNR": nr}
+    else:
+        print("IoU: %2.4f, C-IoU: %2.4f, NR: %2.4f  (void images excluded)" % (iou, ciou, nr))
+        return {"IoU": iou, "C-IoU": ciou, "NR": nr}
+
+ciou_module.compute_IoU_cIoU = patched_compute_IoU_cIoU
+
 # --------------------------------------------------------------------
 # 3. Sentinel-2 visualisation (percentile stretch denormalisation)
 # --------------------------------------------------------------------
@@ -167,7 +232,7 @@ def patch_optimizer_frozen(trainer):
     param_groups = [
         {"params": patch_embed_params, "lr": 5e-4, "name": "patch_embed"},
         {"params": pos_embed_params,   "lr": 5e-4, "name": "pos_embed"},
-        {"params": decoder_params,     "lr": 1e-3, "name": "decoder"},
+        {"params": decoder_params,     "lr": 3e-4, "name": "decoder"},  # was 1e-3 — too high, collapsed to constant token
         {"params": other_params,       "lr": cfg.learning_rate, "name": "other"},
     ]
     trainer.logger.info(
@@ -205,7 +270,7 @@ def patch_optimizer_strategy_b(trainer):
         {"params": patch_embed_params, "lr": 5e-4, "name": "patch_embed"},
         {"params": pos_embed_params,   "lr": 5e-4, "name": "pos_embed"},
         {"params": attn_params,        "lr": 3e-5, "name": "attn_blocks"},
-        {"params": decoder_params,     "lr": 1e-3, "name": "decoder"},
+        {"params": decoder_params,     "lr": 3e-4, "name": "decoder"},  # was 1e-3 — too high, collapsed to constant token
         {"params": other_params,       "lr": cfg.learning_rate, "name": "other"},
     ]
 
@@ -490,7 +555,20 @@ def main(cfg):
 
         self.save_best_and_latest_checkpoint = types.MethodType(_patched_save, self)
 
-        # ----- Inject train_iou column into metrics.csv via csv.writer wrapper -----
+        # ----- Hook train_one_epoch to capture per-epoch coords/perm loss split -----
+        _orig_train_one_epoch = self.train_one_epoch.__func__
+
+        def _patched_train_one_epoch(self_inner, *args, **kwargs):
+            loss_dict, iter_idx = _orig_train_one_epoch(self_inner, *args, **kwargs)
+            self_inner._last_coords_loss = loss_dict.get('coords_loss', float('nan'))
+            self_inner._last_perm_loss   = loss_dict.get('perm_loss',   float('nan'))
+            return loss_dict, iter_idx
+
+        self.train_one_epoch = types.MethodType(_patched_train_one_epoch, self)
+        self._last_coords_loss = float('nan')
+        self._last_perm_loss   = float('nan')
+
+        # ----- Inject extra columns into metrics.csv via csv.writer wrapper -----
         import csv as _csv_module
         _OriginalWriter = _csv_module.writer
         _trainer_ref = self
@@ -501,9 +579,13 @@ def main(cfg):
             def writerow(self, row):
                 row = list(row)
                 if row and row[0] == 'epoch':
-                    row.append('train_iou')
+                    row += ['train_iou', 'coords_loss', 'perm_loss']
                 else:
-                    row.append(getattr(_trainer_ref, '_last_train_iou', float('nan')))
+                    row += [
+                        getattr(_trainer_ref, '_last_train_iou',    float('nan')),
+                        getattr(_trainer_ref, '_last_coords_loss',  float('nan')),
+                        getattr(_trainer_ref, '_last_perm_loss',    float('nan')),
+                    ]
                 self._w.writerow(row)
             def __getattr__(self, name):
                 return getattr(self._w, name)

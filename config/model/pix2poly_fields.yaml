@@ -14,7 +14,7 @@ tokenizer:
   pad_idx: null          # computed at runtime: 35 (32+BOS+EOS+PAD)
   generation_steps: 385
 
-shuffle_polygons: false
+shuffle_polygons: true
 
 fusion: patch_concat
 

@@ -139,6 +139,9 @@ def patched_compute_IoU_cIoU(input_json, gti_annotations, subset=False, pbar_dis
         return {"IoU": iou, "C-IoU": ciou, "NR": nr}
 
 ciou_module.compute_IoU_cIoU = patched_compute_IoU_cIoU
+# Also patch the local binding inside evaluator.py (imported via "from .cIoU import compute_IoU_cIoU")
+import pixelspointspolygons.eval.evaluator as _eval_module_ciou
+_eval_module_ciou.compute_IoU_cIoU = patched_compute_IoU_cIoU
 
 # --------------------------------------------------------------------
 # 3. Sentinel-2 visualisation (percentile stretch denormalisation)
@@ -189,7 +192,7 @@ def patch_decoder(model):
         layer.multihead_attn.dropout = 0.2
 
 # --------------------------------------------------------------------
-# 6. Optimiser & scheduler utilities 
+# 6. Optimiser & scheduler utilities
 # --------------------------------------------------------------------
 def _rebuild_scheduler(trainer):
     """Replace the current scheduler with a fresh one tied to trainer.optimizer."""
@@ -308,6 +311,49 @@ def main(cfg):
         self.setup_dataloader()
         self.setup_optimizer()
         self.setup_loss_fn_dict()
+
+        # ----- Disable torch.compile so the forward patch stays active -----
+        torch.compile = lambda m, **kw: m
+
+        # ----- Entire forward in float32 — decoder fp16 overflow was the NaN source -----
+        import pixelspointspolygons.models.pix2poly.model_pix2poly as _m
+        def _safe_perm_forward(self_m, x_image, x_lidar, y):
+            with torch.amp.autocast('cuda', enabled=False):
+                if self_m.cfg.experiment.encoder.use_images and not self_m.cfg.experiment.encoder.use_lidar:
+                    features = self_m.encoder(x_image.float())
+                elif not self_m.cfg.experiment.encoder.use_images and self_m.cfg.experiment.encoder.use_lidar:
+                    features = self_m.encoder(x_lidar.float())
+                else:
+                    features = self_m.encoder(x_image.float(), x_lidar.float())
+                seq_pred, features = self_m.decoder(features, y)
+                perm_mat1 = self_m.scorenet1(features.float())
+                perm_mat2 = self_m.scorenet2(features.float())
+                perm_mat = perm_mat1 + torch.transpose(perm_mat2, 1, 2)
+                perm_mat = _m.log_optimal_transport(
+                    perm_mat, self_m.bin_score.float(), self_m.sinkhorn_iterations
+                )[:, :perm_mat.shape[1], :perm_mat.shape[2]]
+                perm_mat = torch.nn.functional.softmax(perm_mat, dim=-1)
+            return seq_pred, perm_mat
+        type(self.model).forward = _safe_perm_forward
+        print(f"[BCE fix] model type: {type(self.model).__name__}, forward patched: {type(self.model).forward is _safe_perm_forward}")
+
+        # ----- Patch BCELoss to clamp + diagnose before the assert fires -----
+        import torch.nn as _nn
+        _orig_bce = self.loss_fn_dict["perm"]
+        class _SafeBCE(_nn.Module):
+            def forward(self_, pred, target):
+                pred32 = pred.float()
+                target32 = target.float()
+                bad_pred = (pred32 < 0) | (pred32 > 1) | pred32.isnan()
+                bad_tgt  = (target32 < 0) | (target32 > 1) | target32.isnan()
+                if bad_pred.any() or bad_tgt.any():
+                    print(f"[BCE diag] pred  min={pred32.min():.4f} max={pred32.max():.4f} nan={pred32.isnan().sum()} bad={bad_pred.sum()}")
+                    print(f"[BCE diag] target min={target32.min():.4f} max={target32.max():.4f} nan={target32.isnan().sum()} bad={bad_tgt.sum()}")
+                # nan.clamp() = nan — replace NaN first, then clamp to valid range
+                pred32   = torch.nan_to_num(pred32, nan=0.5, posinf=1.0 - 1e-6, neginf=1e-6).clamp(min=1e-6, max=1.0 - 1e-6)
+                target32 = target32.clamp(min=0.0, max=1.0)
+                return _orig_bce(pred32, target32)
+        self.loss_fn_dict["perm"] = _SafeBCE()
 
         patch_decoder(self.model)
 

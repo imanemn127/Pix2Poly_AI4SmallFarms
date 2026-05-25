@@ -26,7 +26,8 @@ Sentinel-2 is 10 m/pixel, 3-band uint16. That gap creates several concrete probl
 | NumPy ≥ 2.0 in base env | `torch.from_numpy()` raises `RuntimeError` | Dedicated `ai4sf` conda env pinned to NumPy 1.26.4 |
 | Evaluator hard-codes category 100 (building) | IoU evaluated against wrong category | Evaluator and predictor patched to use category id=1 (field) |
 | `calc_IoU` returns 1.0 for void images | Fake IoU floor (~0.051) masks real model performance | Patched to return `nan`; void images excluded from the mean |
-| Decoder mode collapse | Coordinate tokens stuck at constant bin (0 or 31) for all inputs | Decoder LR reduced from 1e-3 to 3e-4; `vertex_loss_weight` raised to force coordinate learning |
+| Decoder mode collapse | Coordinate tokens stuck at constant bin (0 or 31) for all inputs | Decoder LR reduced from 1e-3 to 3e-4; `vertex_loss_weight` raised to force coordinate learning; `shuffle_polygons` enabled so polygon order varies each batch |
+| fp16 overflow in Sinkhorn | `log_sinkhorn_iterations` uses `logsumexp` which overflows in fp16 → NaN in `perm_mat` → BCELoss CUDA kernel assertion | Entire model forward (encoder + decoder + Sinkhorn) forced to float32 via `autocast('cuda', enabled=False)`; AMP and `torch.compile` disabled at runtime |
 
 The approach is to patch the installed package **at runtime** rather than modifying it on
 disk, keeping the fork clean and making the patches explicit and auditable.
@@ -253,6 +254,7 @@ Key parameters:
 | `num_patches` | 64 | `(32 / 4)²` |
 | `num_bins` | 32 | one bin per pixel column/row |
 | `shuffle_tokens` | false | vertex order fixed; shuffling disabled for sequence stability |
+| `shuffle_polygons` | true | polygon order randomised each batch; prevents decoder from memorising a fixed sequence order |
 | `max_num_vertices` | 192 | total vertices across all polygons in one patch; ~15.5 % of patches dropped at load time |
 | `max_len` | 386 | 192 × 2 coords + BOS + EOS, computed at runtime |
 | `generation_steps` | 385 | matches `max_len` |
@@ -330,17 +332,19 @@ touching anything on disk.
 
 | Patch | Affected module(s) | What it changes |
 |-------|-------------------|-----------------|
-| 1. Dataset | `pixelspointspolygons.datasets.p3_coco` | Replaces dataset classes with local `p3_coco.py` versions: safe tensor conversion, no LiDAR, filters patches exceeding `max_num_vertices` at load time. |
+| 1a. Dataset | `pixelspointspolygons.datasets.p3_coco` | Replaces dataset classes with local `p3_coco.py` versions: safe tensor conversion, no LiDAR, filters patches exceeding `max_num_vertices` at load time. |
+| 1b. cv2 import fix | `pixelspointspolygons.datasets.build_datasets` | Injects `cv2` into the module namespace; the package imports it at the top level but does not list it as a dependency, causing `NameError` at dataloader build time. |
 | 2. ViT backbone | `pixelspointspolygons.models.vision_transformer` and `…model_pix2poly` | Replaces `ViT` with `modified_vit.ViT`: builds at `img_size=32, patch_size=4`, discards pretrained `pos_embed` and `patch_embed`, keeps attention weights. |
 | 3a. Evaluator category | `pixelspointspolygons.eval.evaluator` | Overrides `compute_coco_metrics` to use `catIds=[1]` (field) instead of hard-coded `[100]` (building). |
 | 3b. Prediction category | `pixelspointspolygons.misc.coco_conversions` and `…predictor_pix2poly` | Wraps `generate_coco_ann` to write `category_id=1` into every predicted annotation. |
-| 3c. IoU metric fix | `pixelspointspolygons.eval.cIoU` | `calc_IoU` returned 1.0 when both GT and prediction are empty (union=0), creating a fake floor of ~0.051 (5.1 % of val images have no annotation). Now returns `nan`; void images excluded from the mean. |
+| 3c. IoU metric fix | `pixelspointspolygons.eval.cIoU` and `…eval.evaluator` | `calc_IoU` returned 1.0 when both GT and prediction are empty (union=0), creating a fake floor of ~0.051 (5.1 % of val images have no annotation). Now returns `nan`. `compute_IoU_cIoU` rewritten to skip void images using `nanmean`; the local binding inside `evaluator.py` is also repatched (it imports `compute_IoU_cIoU` by name, so the module-level replacement alone is not enough). |
 | 4. Visualisation | `pixelspointspolygons.misc.shared_utils` and `…trainer_pix2poly` | Replaces `denormalize_image_for_visualization` with `denormalize_s2`: inverts Normalize, then applies per-channel p2–p98 percentile stretch. Needed because S2 reflectance clusters in the bottom 20–30 % of the range; linear rescaling produces near-black images. |
 | 5. Decoder regularisation | model object | `patch_decoder(model)` increases dropout from 0.1 → 0.2 in every `TransformerDecoderLayer`. |
 | 6. Training strategy | optimizer + scheduler | Two-phase: phase 1 freezes ViT attention for `FREEZE_EPOCHS` epochs; phase 2 unfreezes with low LR and restarts warmup. |
 | 7. Visualization gating | `trainer.visualization` | Skips visualization on non-val epochs; draws GT from raw COCO pixel coordinates instead of decoded tokens. |
 | 8. Train IoU logging | CSV writer (swapped at module level) + `save_best_and_latest_checkpoint` hook | Every `val_every` epochs the predictor runs on a fixed 512-image train subset selected randomly (seed=0, shuffle=False) spread across all tiles; the result is appended as a `train_iou` column to `metrics.csv` without modifying `train_val_loop`. |
 | 9. Loss breakdown logging | `train_one_epoch` hook + CSV writer | Captures `coords_loss` and `perm_loss` each epoch and writes them as extra CSV columns, enabling diagnosis of coordinate vs permutation learning. |
+| 10. Float32 forward | `type(model).forward` monkey-patch + `torch.compile` override | Replaces `EncoderDecoder.forward` with `_safe_perm_forward`: runs the entire forward (encoder, decoder, Sinkhorn) inside `autocast('cuda', enabled=False)`. Prevents fp16 overflow in `log_sinkhorn_iterations` which produced all-NaN `perm_mat` and crashed BCELoss. `torch.compile` is overridden to identity so the patch is not bypassed by `OptimizedModule`. |
 
 Nothing in the installed package is touched on disk.
 
@@ -406,10 +410,10 @@ All inherited from the
 
 | Optimisation | Effect |
 |---|---|
-| Mixed precision (AMP) | ~2× memory reduction, faster forward/backward |
-| `torch.compile` | Faster iterations after the first step |
+| Mixed precision (AMP) | Disabled — fp16 overflows in `log_sinkhorn_iterations`; entire forward runs in float32 |
+| `torch.compile` | Disabled — wraps model in `OptimizedModule`, breaking the `type(model).forward` monkey-patch |
 | Gradient clipping (norm 1.0) | Prevents divergence with long vertex sequences |
-| BCELoss NaN fix | Clamps logits to avoid `log(0)` |
+| BCELoss NaN guard | `nan_to_num` before clamp; safety net in case any NaN survives to the loss |
 | Memory cleanup per epoch | `empty_cache()` + `gc.collect()` |
 
 ---
@@ -466,6 +470,12 @@ Lower `batch_size` in `config/run_type/ai4smallfarms.yaml`.
 If you save with a compiled model and load into an uncompiled one (or vice versa),
 `load_state_dict` will complain. Fix: strip or add the prefix when loading, or always
 compile before loading.
+
+**`Assertion 'input_val >= zero && input_val <= one' failed` in `Loss.cu`**  
+BCELoss CUDA kernel received NaN values. Root cause: `log_sinkhorn_iterations` uses
+`logsumexp` which overflows in fp16, producing NaN in `perm_mat`. Fix: patch 10
+forces the entire forward to float32. If the crash still occurs, check that
+`torch.compile` is disabled (patch 10 also overrides it).
 
 **`val_iou` is always NaN**  
 `coords_loss` must drop below its epoch-0 value (~3.5 × `vertex_loss_weight`) before

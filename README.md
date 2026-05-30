@@ -264,7 +264,7 @@ Key parameters:
 | `image_max_pixel_value` | 10000.0 | S2 reflectance scale factor |
 | `augmentations` | D4 + Normalize | 8-fold dihedral group + channel normalisation |
 | `batch_size` | 4 | in `run_type/ai4smallfarms.yaml` |
-| `vertex_loss_weight` | 10.0 | coordinate cross-entropy weight; raised from 1.0 to fix decoder mode collapse |
+| `vertex_loss_weight` | 3.0 | coordinate cross-entropy weight; history: 1.0 (default, coords ignored) → 10.0 (coord learning starts but dominates perm loss, very slow convergence) → 5.0 (better balance, IoU slowly rising to 0.003 at epoch 99) → 3.0 (faster loss descent, predicted point moves toward image centre) |
 | `perm_loss_weight` | 3.0 | permutation matrix BCE weight; reduced from P3 default of 10.0 |
 | `learning_rate` | decoder 3e-4, patch/pos embed 5e-4, attn 3e-5, other 3e-4 | per-group AdamW |
 | `num_epochs` | 100 | |
@@ -415,6 +415,38 @@ All inherited from the
 | Gradient clipping (norm 1.0) | Prevents divergence with long vertex sequences |
 | BCELoss NaN guard | `nan_to_num` before clamp; safety net in case any NaN survives to the loss |
 | Memory cleanup per epoch | `empty_cache()` + `gc.collect()` |
+
+---
+
+## Results
+
+### Run history
+
+Runs 1–2 use `patch_size=2`. From Run 3 onward `patch_size=4`.
+`calc_IoU` was broken (void images returned 1.0, creating a ~0.051 floor) through Run 4;
+fixed in Run 5. Val_iou values for Runs 1–4 are therefore unreliable.
+
+| Run | Date | patch_size | Key change vs previous | val_iou (best) | Epochs | Notes |
+|-----|------|------------|------------------------|----------------|--------|-------|
+| 1 | 2026-05-18 | 2 | baseline, max_vertices=384, perm_w=10.0 | 0.171 (floor) | 34 | calc_IoU broken; values unreliable |
+| 2 | 2026-05-21 | 2 | max_vertices=192, perm_w=3.0, attn LR=3e-5 | 0.051 (floor) | 49 | calc_IoU broken; values unreliable |
+| 3 | 2026-05-22 | 4 | patch_size=4 | 0.081 @ ep9, then 0.051 (floor) | 51 | first sign of life; calc_IoU still broken; CUDA crash (fp16 Sinkhorn) |
+| 4 | 2026-05-22 | 4 | real S2 normalisation (mean/std from training set) | 0.051 (floor) | 28 | normalisation alone did not move IoU; calc_IoU still broken |
+| 5 | 2026-05-23 | 4 | calc_IoU fix (void→nan) | 0.0 | 31 | real IoU now visible; decoder collapse confirmed; coords_loss flat at ~3.5 |
+| 6 | 2026-05-23 | 4 | vtx_w=10, perm_w=3, decoder LR 1e-3→3e-4, fp32 forward | 0.0002 | 34 | coords_loss finally dropping; fp16 CUDA crash resolved |
+| 7 | 2026-05-24 | 4 | shuffle_polygons=true | 0.0002 | 56 | predicted point begins moving; collapse not broken |
+| 8 | 2026-05-25 | 4 | vtx_w 10→5 | 0.0032 @ ep99 | 99 | first sustained IoU rise; loss 17.3→8.2; still single-point output |
+| 9 | 2026-05-27 | 4 | vtx_w 5→3 | 0.0007 @ ep70 | 70 | faster loss descent (9.97→5.20); decoder collapse persists; run stopped |
+
+### Conclusion
+
+Despite systematic tuning of `vertex_loss_weight` (1.0→10.0→5.0→3.0), decoder LR,
+`shuffle_polygons`, and fp32 stabilisation, the decoder consistently collapses to a
+single predicted vertex regardless of input. The autoregressive design appears
+fundamentally ill-suited to the very small (32×32) Sentinel-2 patches and the dense
+multi-polygon structure of smallholder fields.
+
+**Next step:** explore PLR-Net as suggested by supervisor.
 
 ---
 

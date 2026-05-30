@@ -20,7 +20,7 @@ fusion: patch_concat
 
 # optimization
 sinkhorn_iterations: 100
-vertex_loss_weight: 5.0   # was 10.0 — too dominant, model collapsed to single point; 1.0 too weak (coords ignored)
+vertex_loss_weight: 3.0   # 10.0→collapsed to single point; 5.0→still dominant after 100ep; 1.0→coords ignored
 perm_loss_weight: 3.0  # reduced from 10.0 — dense perm matrix overwhelmed coord signal
 
 # training
